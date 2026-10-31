@@ -12,14 +12,14 @@ pub struct Config {
     pub agents: bool,
     pub track_claude: bool,
     pub track_codex: bool,
-    pub finish_alerts: bool,
+    pub finish_popup: bool,
     pub hide_fullscreen: bool,
     pub tab: Tab,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_alerts: true, hide_fullscreen: true, tab: Tab::Media }
+        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_popup: false, hide_fullscreen: true, tab: Tab::Media }
     }
 }
 

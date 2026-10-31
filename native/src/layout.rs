@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 pub const CANVAS_W: f32 = 640.0;
 pub const CANVAS_H: f32 = 170.0;
 const DURATION_MS: f32 = 240.0;
+const MEDIA_W: f32 = 320.0;
+const MEDIA_LYRICS_W: f32 = 540.0;
+const AGENTS_W: f32 = 420.0;
+const SESSION_W: f32 = 480.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -54,7 +58,21 @@ pub fn shape_for(mode: Mode) -> Shape {
     match mode {
         Mode::Rest => Shape { w: 56.0, h: 4.0, radius: 2.0, y: 2.0 },
         Mode::Peek => Shape { w: 280.0, h: 30.0, radius: 13.0, y: 0.0 },
-        Mode::Open => Shape { w: 600.0, h: 136.0, radius: 22.0, y: 0.0 },
+        Mode::Open => open_shape(MEDIA_W),
+    }
+}
+
+pub fn open_shape(w: f32) -> Shape {
+    Shape { w, h: 136.0, radius: 22.0, y: 0.0 }
+}
+
+/// How wide the open notch needs to be for what it is showing.
+pub fn open_width(tab: Tab, lyrics_showing: bool, session_open: bool) -> f32 {
+    match tab {
+        Tab::Media if lyrics_showing => MEDIA_LYRICS_W,
+        Tab::Media => MEDIA_W,
+        Tab::Agents if session_open => SESSION_W,
+        Tab::Agents => AGENTS_W,
     }
 }
 
@@ -153,6 +171,13 @@ mod tests {
         assert_eq!(tabs(true, true), vec![Tab::Media, Tab::Agents]);
         assert_eq!(tabs(false, true), vec![Tab::Agents]);
         assert!(tabs(false, false).is_empty());
+    }
+
+    #[test]
+    fn lyrics_off_is_much_narrower() {
+        assert!(open_width(Tab::Media, false, false) * 1.5 < open_width(Tab::Media, true, false));
+        assert!(open_width(Tab::Media, true, false) * 1.03 < CANVAS_W);
+        assert!(open_width(Tab::Agents, false, true) * 1.03 < CANVAS_W);
     }
 
     #[test]

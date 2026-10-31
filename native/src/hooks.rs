@@ -82,6 +82,9 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
         }
         if holds {
             let label = agents::tool_label(tool, &data["tool_input"]);
+            let input = &data["tool_input"];
+            let what = ["command", "file_path", "url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or(tool);
+            let what = what.chars().take(400).collect::<String>();
             let mut held = stream.try_clone().ok();
             if let Some(conn) = held.take() {
                 let mut conn = conn;
@@ -89,7 +92,7 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
                     respond(&mut conn, "200 OK", answer.as_deref().unwrap_or(""));
                     let _ = conn.shutdown(std::net::Shutdown::Write);
                 });
-                hub.hold(Agent::Claude, &id, label, data["tool_input"].clone(), responder, now);
+                hub.hold(Agent::Claude, &id, label, what, data["tool_input"].clone(), responder, now);
                 drop(hub);
                 on_change();
                 // Stay on this thread until the agent closes the connection, so a request

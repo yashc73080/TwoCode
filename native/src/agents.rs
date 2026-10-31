@@ -9,6 +9,9 @@ const KEEP_FINISHED_MS: u64 = 30 * 60 * 1000;
 const FORGET_MS: u64 = 6 * 60 * 60 * 1000;
 const FRESH_MS: u64 = 15 * 1000; // older events are history being replayed at startup, not news
 const HOLD_MS: u64 = 300 * 1000;
+const QUIET_S: u64 = 30; // no news for this long: it may be stuck or waiting in its own window
+const MAX_STEPS: usize = 8;
+const MAX_FILES: usize = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Agent {
@@ -39,6 +42,16 @@ pub enum Event {
     Meta { cwd: String },
     Turn,
     Tool { label: String },
+    /// What the agent last wrote or reasoned, in its own words.
+    Said(String),
+    /// What you asked for this turn.
+    Prompt(String),
+    Plan(PlanChange),
+    FileChanged(String),
+    /// A test command started; its result arrives under this tool id.
+    TestStarted(String),
+    ToolResult { id: String, failed: bool },
+    TestResult(bool),
     ToolDone,
     Done,
     Failed(String),
@@ -47,11 +60,60 @@ pub enum Event {
     End,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PlanState {
+    Pending,
+    Active,
+    Done,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct PlanItem {
+    pub text: String,
+    pub state: PlanState,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum PlanChange {
+    Replace(Vec<PlanItem>),
+    Add(String),
+    /// Finish the active item and start the next waiting one.
+    Advance,
+    /// Item numbers count from 1.
+    Mark { done: Vec<usize>, start: Option<usize> },
+}
+
+fn change_plan(plan: &mut Vec<PlanItem>, change: PlanChange) {
+    match change {
+        PlanChange::Replace(items) => *plan = items,
+        PlanChange::Add(text) => plan.push(PlanItem { text, state: PlanState::Pending }),
+        PlanChange::Advance => {
+            for item in plan.iter_mut().filter(|i| i.state == PlanState::Active) {
+                item.state = PlanState::Done;
+            }
+            if let Some(next) = plan.iter_mut().find(|i| i.state == PlanState::Pending) {
+                next.state = PlanState::Active;
+            }
+        }
+        PlanChange::Mark { done, start } => {
+            for number in done {
+                if let Some(item) = number.checked_sub(1).and_then(|at| plan.get_mut(at)) {
+                    item.state = PlanState::Done;
+                }
+            }
+            if let Some(item) = start.and_then(|n| n.checked_sub(1)).and_then(|at| plan.get_mut(at)) {
+                item.state = PlanState::Active;
+            }
+        }
+    }
+}
+
 /// Answers a held PermissionRequest. `None` means "no opinion": the agent asks in its own window.
 pub type Responder = Box<dyn FnOnce(Option<String>) + Send>;
 
 struct Hold {
     responder: Responder,
+    what: String,
     input: Value,
     since: u64,
 }
@@ -66,6 +128,23 @@ struct Session {
     ended: Option<u64>,
     updated: u64,
     hold: Option<Hold>,
+    said: String,
+    steps: Vec<Step>,
+    prompt: String,
+    plan: Vec<PlanItem>,
+    files: Vec<String>,
+    tests: Option<bool>,
+    test_tool: Option<String>,
+    /// Finished and the pill has not been acknowledged yet.
+    unseen: bool,
+    /// You have looked at the result, so the list can let it go.
+    viewed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    pub label: String,
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +156,96 @@ pub struct SessionView {
     pub detail: String,
     pub elapsed_s: u64,
     pub can_decide: bool,
+    /// The exact command or file a held request is about.
+    pub approval: String,
+    pub said: String,
+    pub steps: Vec<Step>,
+    pub quiet_s: u64,
+    pub prompt: String,
+    pub plan: Vec<PlanItem>,
+    pub files: Vec<String>,
+    pub tests: Option<bool>,
+    pub unseen: bool,
+    pub turn_over: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Pill {
+    Quiet,
+    Working,
+    Finished,
+    Failed,
+}
+
+/// The pill's colour: a failure until you look, then active work, then a finish you have not seen.
+pub fn pill_state(list: &[SessionView]) -> Pill {
+    if list.iter().any(|s| s.status == Status::Error && s.unseen) {
+        Pill::Failed
+    } else if list.iter().any(|s| s.status == Status::Running || (s.status == Status::Waiting && !s.turn_over)) {
+        Pill::Working
+    } else if list.iter().any(|s| s.unseen) {
+        Pill::Finished
+    } else {
+        Pill::Quiet
+    }
+}
+
+impl SessionView {
+    /// "Step 3 of 7: Updating the parser", when the agent keeps a task list.
+    pub fn progress_line(&self) -> Option<String> {
+        let total = self.plan.len();
+        if total == 0 {
+            return None;
+        }
+        let at = self.plan.iter().position(|i| i.state == PlanState::Active).or_else(|| self.plan.iter().position(|i| i.state == PlanState::Pending));
+        Some(match at {
+            Some(at) => format!("Step {} of {total}: {}", at + 1, self.plan[at].text),
+            None => format!("All {total} steps done"),
+        })
+    }
+
+    pub fn progress(&self) -> Option<f32> {
+        if self.plan.is_empty() {
+            return None;
+        }
+        let done = self.plan.iter().filter(|i| i.state == PlanState::Done).count();
+        Some(done as f32 / self.plan.len() as f32)
+    }
+
+    /// "Changed 4 files · tests passed · took 6m 02s".
+    pub fn summary(&self) -> String {
+        let mut parts = vec![match self.files.len() {
+            0 => "No files changed".to_string(),
+            1 => "Changed 1 file".to_string(),
+            n => format!("Changed {n} files"),
+        }];
+        match self.tests {
+            Some(true) => parts.push("tests passed".to_string()),
+            Some(false) => parts.push("tests failed".to_string()),
+            None => {}
+        }
+        if self.elapsed_s > 0 {
+            parts.push(format!("took {}", crate::layout::elapsed(self.elapsed_s)));
+        }
+        parts.join(" · ")
+    }
+
+    pub fn is_quiet(&self) -> bool {
+        self.status == Status::Running && self.quiet_s >= QUIET_S
+    }
+
+    /// One plain phrase for what this session needs from you.
+    pub fn status_text(&self) -> String {
+        match self.status {
+            Status::Waiting if self.can_decide => "Needs approval".to_string(),
+            Status::Waiting => "Needs you".to_string(),
+            Status::Error => "Error".to_string(),
+            Status::Running if self.is_quiet() => format!("Quiet for {}", crate::layout::elapsed(self.quiet_s)),
+            Status::Running => "Working".to_string(),
+            Status::Done => "Done".to_string(),
+            Status::Idle => "Stopped".to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +268,15 @@ impl Hub {
             ended: None,
             updated: ts,
             hold: None,
+            said: String::new(),
+            steps: vec![],
+            prompt: String::new(),
+            plan: vec![],
+            files: vec![],
+            tests: None,
+            test_tool: None,
+            unseen: false,
+            viewed: false,
         })
     }
 
@@ -128,6 +306,15 @@ impl Hub {
                 release(s, None);
                 s.status = Status::Running;
                 s.detail = "Thinking".to_string();
+                s.said.clear();
+                s.steps.clear();
+                s.prompt.clear();
+                s.plan.clear();
+                s.files.clear();
+                s.tests = None;
+                s.test_tool = None;
+                s.unseen = false;
+                s.viewed = false;
                 s.started = Some(ts);
                 s.ended = None;
             }
@@ -136,13 +323,36 @@ impl Hub {
                     s.started = Some(ts);
                 }
                 s.ended = None;
+                s.steps.push(Step { label: label.clone(), done: false });
+                if s.steps.len() > MAX_STEPS {
+                    s.steps.remove(0);
+                }
                 s.detail = label;
                 if s.hold.is_none() {
                     s.status = Status::Running;
                 }
             }
+            Event::Said(text) => s.said = text,
+            Event::Prompt(text) => s.prompt = text,
+            Event::Plan(change) => change_plan(&mut s.plan, change),
+            Event::FileChanged(name) => {
+                if !s.files.contains(&name) && s.files.len() < MAX_FILES {
+                    s.files.push(name);
+                }
+            }
+            Event::TestStarted(id) => s.test_tool = Some(id),
+            Event::ToolResult { id, failed } => {
+                if s.test_tool.as_deref() == Some(id.as_str()) {
+                    s.tests = Some(!failed);
+                    s.test_tool = None;
+                }
+            }
+            Event::TestResult(passed) => s.tests = Some(passed),
             Event::ToolDone => {
                 release(s, None);
+                if let Some(step) = s.steps.iter_mut().find(|step| !step.done) {
+                    step.done = true;
+                }
                 if s.started.is_none() || s.ended.is_some() {
                     s.started = Some(ts);
                 }
@@ -151,10 +361,15 @@ impl Hub {
             }
             Event::Done => {
                 release(s, None);
-                finished = (s.status != Status::Done).then_some(Status::Done);
-                s.status = Status::Done;
-                s.detail = "Finished".to_string();
+                // A turn that ends on a question is waiting for you, not finished.
+                let next = if s.said.trim_end().ends_with('?') { Status::Waiting } else { Status::Done };
+                finished = (s.status != next).then_some(next);
+                s.status = next;
+                s.detail = if next == Status::Waiting { "Asked you a question" } else { "Finished" }.to_string();
                 s.ended = Some(ts);
+                for step in &mut s.steps {
+                    step.done = true;
+                }
             }
             Event::Failed(why) => {
                 release(s, None);
@@ -170,13 +385,17 @@ impl Hub {
                 s.ended = Some(ts);
             }
             Event::ExternalWait(what) => {
+                finished = (s.status != Status::Waiting).then_some(Status::Waiting);
                 s.status = Status::Waiting;
                 s.detail = what;
             }
             Event::Meta { .. } | Event::End => {}
         }
         if let Some(status) = finished {
-            if now.saturating_sub(ts) < FRESH_MS {
+            let fresh = now.saturating_sub(ts) < FRESH_MS;
+            s.unseen = fresh;
+            s.viewed = !fresh; // history replayed at startup is not news
+            if fresh {
                 let project = s.project.clone();
                 self.finished_count += 1;
                 self.last_finished = Some((agent, project, status));
@@ -184,11 +403,27 @@ impl Hub {
         }
     }
 
+    /// You opened the notch, so the pill goes back to black.
+    pub fn acknowledge(&mut self) {
+        for s in self.sessions.values_mut() {
+            s.unseen = false;
+        }
+    }
+
+    /// You looked at the agents page: finished work and errors can leave the list.
+    pub fn mark_viewed(&mut self) {
+        for s in self.sessions.values_mut() {
+            if matches!(s.status, Status::Done | Status::Error) {
+                s.viewed = true;
+            }
+        }
+    }
+
     /// Keep a PermissionRequest open until someone answers in the notch or the agent moves on.
-    pub fn hold(&mut self, agent: Agent, id: &str, label: String, input: Value, responder: Responder, now: u64) {
+    pub fn hold(&mut self, agent: Agent, id: &str, label: String, what: String, input: Value, responder: Responder, now: u64) {
         let s = self.entry(agent, id, now);
         release(s, None);
-        s.hold = Some(Hold { responder, input, since: now });
+        s.hold = Some(Hold { responder, what, input, since: now });
         s.status = Status::Waiting;
         s.detail = label;
         s.updated = now;
@@ -247,13 +482,14 @@ impl Hub {
             .sessions
             .values()
             .filter(|s| match s.status {
-                Status::Waiting => true,
+                Status::Waiting => s.hold.is_some() || now.saturating_sub(s.updated) < KEEP_FINISHED_MS,
                 Status::Running => now.saturating_sub(s.updated) <= STALE_RUNNING_MS,
-                Status::Done | Status::Error => now.saturating_sub(s.updated) < KEEP_FINISHED_MS,
+                Status::Done | Status::Error => !s.viewed && now.saturating_sub(s.updated) < KEEP_FINISHED_MS,
                 Status::Idle => false,
             })
             .collect();
-        list.sort_by_key(|s| (s.status as u8, std::cmp::Reverse(s.updated)));
+        // What needs you comes first, then whatever was active most recently.
+        list.sort_by_key(|s| (s.status != Status::Waiting, std::cmp::Reverse(s.updated)));
         list.into_iter()
             .map(|s| SessionView {
                 agent: s.agent,
@@ -263,6 +499,16 @@ impl Hub {
                 detail: s.detail.clone(),
                 elapsed_s: s.started.map_or(0, |at| s.ended.unwrap_or(now).saturating_sub(at) / 1000),
                 can_decide: s.hold.is_some(),
+                approval: s.hold.as_ref().map_or(String::new(), |h| h.what.clone()),
+                said: s.said.clone(),
+                steps: s.steps.clone(),
+                quiet_s: if s.status == Status::Running { now.saturating_sub(s.updated) / 1000 } else { 0 },
+                prompt: s.prompt.clone(),
+                plan: s.plan.clone(),
+                files: s.files.clone(),
+                tests: s.tests,
+                unseen: s.unseen,
+                turn_over: s.ended.is_some(),
             })
             .collect()
     }
@@ -334,6 +580,97 @@ pub fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// The last thing said, short enough for the notch and without markdown marks.
+pub fn latest_words(text: &str) -> String {
+    const MAX: usize = 220;
+    let clean = text.replace("**", "").replace('`', "").replace('#', "");
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = clean.chars().count();
+    if count <= MAX {
+        return clean;
+    }
+    let tail: String = clean.chars().skip(count - MAX).collect();
+    match tail.find(". ") {
+        Some(at) if at < MAX / 2 => tail[at + 2..].to_string(),
+        _ => format!("…{tail}"),
+    }
+}
+
+/// What you asked, without comment markers or quote marks from a pasted reply.
+fn prompt_line(text: &str) -> String {
+    let mut rest = text;
+    let mut clean = String::new();
+    while let Some(start) = rest.find("<!--") {
+        clean.push_str(&rest[..start]);
+        rest = rest[start..].find("-->").map_or("", |end| &rest[start + end + 3..]);
+    }
+    clean.push_str(rest);
+    let lines: Vec<&str> = clean.lines().map(|l| l.trim_start().trim_start_matches('>').trim()).filter(|l| !l.is_empty()).collect();
+    one_line(&lines.join(" "), 120)
+}
+
+fn is_test_command(command: &str) -> bool {
+    let c = command.to_lowercase();
+    ["cargo test", "npm test", "npm run test", "yarn test", "pnpm test", "pytest", "jest", "vitest", "go test", "dotnet test", "node --test"]
+        .iter()
+        .any(|t| c.contains(t))
+}
+
+fn plan_state(status: &str) -> PlanState {
+    match status {
+        "in_progress" => PlanState::Active,
+        "completed" | "done" => PlanState::Done,
+        _ => PlanState::Pending,
+    }
+}
+
+fn plan_items(list: &Value, text_keys: &[&str]) -> Vec<PlanItem> {
+    list.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| PlanItem {
+                    text: one_line(text_keys.iter().find_map(|k| i[*k].as_str()).unwrap_or(""), 80),
+                    state: plan_state(i["status"].as_str().unwrap_or("")),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The task-list tools Claude uses, as plan changes. `None` means this is not one of them.
+fn claude_plan(name: &str, input: &Value) -> Option<Vec<Event>> {
+    let change = match name {
+        "TodoWrite" => Some(PlanChange::Replace(plan_items(&input["todos"], &["content", "activeForm"]))),
+        "TaskCreate" => input["subject"].as_str().map(|s| PlanChange::Add(one_line(s, 80))),
+        "TaskUpdate" => {
+            let number = input["taskId"].as_str().and_then(|id| id.parse::<usize>().ok());
+            match input["status"].as_str() {
+                Some("completed") => Some(PlanChange::Mark { done: number.into_iter().collect(), start: None }),
+                Some("in_progress") => Some(PlanChange::Mark { done: vec![], start: number }),
+                _ => None,
+            }
+        }
+        "mcp__ccd_turn__update_plan" if input["items"].is_array() => Some(PlanChange::Replace(plan_items(&input["items"], &["content"]))),
+        "mcp__ccd_turn__update_plan" if input["advance"] == true => Some(PlanChange::Advance),
+        "mcp__ccd_turn__update_plan" => Some(PlanChange::Mark {
+            done: input["done"].as_array().map(|d| d.iter().filter_map(|n| n.as_u64().map(|n| n as usize)).collect()).unwrap_or_default(),
+            start: input["start"].as_u64().map(|n| n as usize),
+        }),
+        _ => return None,
+    };
+    Some(change.map(Event::Plan).into_iter().collect())
+}
+
+/// File names out of a Codex patch ("*** Update File: src/a.rs").
+fn patched_files(patch: &str) -> Vec<Event> {
+    patch
+        .lines()
+        .filter_map(|l| ["*** Update File: ", "*** Add File: ", "*** Delete File: "].iter().find_map(|p| l.strip_prefix(p)))
+        .map(|path| Event::FileChanged(base(path.trim()).to_string()))
+        .collect()
+}
+
 fn is_interrupt(text: &str) -> bool {
     text.starts_with("[Request interrupted")
 }
@@ -342,6 +679,11 @@ fn is_interrupt(text: &str) -> bool {
 fn is_synthetic(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("<command-") || t.starts_with("<local-command") || t.starts_with("<task-notification") || t.starts_with("<system-reminder")
+}
+
+fn words(text: Option<&str>) -> Option<Event> {
+    let clean = latest_words(text?);
+    (!clean.is_empty()).then_some(Event::Said(clean))
 }
 
 /// One line of ~/.claude/projects/*/<session>.jsonl.
@@ -362,7 +704,10 @@ pub fn parse_claude(line: &str) -> Vec<Event> {
     if kind == "user" {
         match content {
             Value::String(text) if is_interrupt(text) => out.push(Event::Interrupted),
-            Value::String(text) if !is_synthetic(text) => out.push(Event::Turn),
+            Value::String(text) if !is_synthetic(text) => {
+                out.push(Event::Turn);
+                out.push(Event::Prompt(prompt_line(text)));
+            }
             Value::Array(parts) => {
                 let text = parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str());
                 let (mut typed, mut interrupted) = (false, false);
@@ -374,8 +719,15 @@ pub fn parse_claude(line: &str) -> Vec<Event> {
                     out.push(Event::Interrupted);
                 } else if parts.iter().any(|p| p["type"] == "tool_result") {
                     out.push(Event::ToolDone);
+                    for p in parts.iter().filter(|p| p["type"] == "tool_result") {
+                        if let Some(id) = p["tool_use_id"].as_str() {
+                            out.push(Event::ToolResult { id: id.to_string(), failed: p["is_error"] == true });
+                        }
+                    }
                 } else if typed || parts.iter().any(|p| p["type"] == "image") {
                     out.push(Event::Turn);
+                    let first = parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).find(|t| !is_synthetic(t));
+                    out.push(Event::Prompt(prompt_line(first.unwrap_or("Image"))));
                 }
             }
             _ => {}
@@ -387,11 +739,38 @@ pub fn parse_claude(line: &str) -> Vec<Event> {
         return out;
     }
     if let Some(parts) = content.as_array() {
-        for p in parts.iter().filter(|p| p["type"] == "tool_use") {
-            out.push(Event::Tool { label: tool_label(p["name"].as_str().unwrap_or(""), &p["input"]) });
+        for p in parts {
+            match p["type"].as_str().unwrap_or("") {
+                "text" => out.extend(words(p["text"].as_str())),
+                "thinking" => out.extend(words(p["thinking"].as_str())),
+                "tool_use" => match p["name"].as_str().unwrap_or("") {
+                    "AskUserQuestion" => {
+                        out.extend(words(p["input"]["questions"][0]["question"].as_str()));
+                        out.push(Event::ExternalWait("Waiting for your answer".to_string()));
+                    }
+                    "ExitPlanMode" => out.push(Event::ExternalWait("Plan ready for your review".to_string())),
+                    name => {
+                        if let Some(plan) = claude_plan(name, &p["input"]) {
+                            out.extend(plan);
+                            continue;
+                        }
+                        out.push(Event::Tool { label: tool_label(name, &p["input"]) });
+                        if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+                            let file = p["input"]["file_path"].as_str().or(p["input"]["notebook_path"].as_str());
+                            out.extend(file.map(|f| Event::FileChanged(base(f).to_string())));
+                        }
+                        if p["input"]["command"].as_str().is_some_and(is_test_command) {
+                            out.extend(p["id"].as_str().map(|id| Event::TestStarted(id.to_string())));
+                        }
+                    }
+                },
+                _ => {}
+            }
         }
     }
-    if matches!(o["message"]["stop_reason"].as_str(), Some("end_turn" | "stop_sequence" | "max_tokens")) {
+    // Thinking arrives as its own line with the turn's stop reason; the answer itself is still to come.
+    let only_thinking = content.as_array().is_some_and(|parts| !parts.is_empty() && parts.iter().all(|p| p["type"] == "thinking"));
+    if !only_thinking && matches!(o["message"]["stop_reason"].as_str(), Some("end_turn" | "stop_sequence" | "max_tokens")) {
         out.push(Event::Done);
     }
     out
@@ -411,12 +790,41 @@ pub fn parse_codex(line: &str) -> Vec<Event> {
             "task_complete" | "turn_complete" => vec![Event::Done],
             "turn_aborted" => vec![Event::Interrupted],
             "error" => vec![Event::Failed(one_line(p["message"].as_str().unwrap_or("Codex error"), 80))],
+            "item_completed" => match p["item"]["type"].as_str().unwrap_or("") {
+                "UserMessage" => {
+                    let text = p["item"]["content"][0]["text"].as_str().unwrap_or("");
+                    if text.is_empty() { vec![] } else { vec![Event::Prompt(prompt_line(text))] }
+                }
+                "CommandExecution" => {
+                    let command = p["item"]["command"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                    if is_test_command(&command) { p["item"]["exit_code"].as_i64().map(|code| Event::TestResult(code == 0)).into_iter().collect() } else { vec![] }
+                }
+                _ => vec![],
+            },
             "exec_approval_request" | "apply_patch_approval_request" => {
                 vec![Event::ExternalWait("Waiting for approval in Codex".to_string())]
             }
             _ => vec![],
         },
         "response_item" => match kind {
+            "message" if p["role"] == "assistant" => {
+                p["content"].as_array().map_or(vec![], |parts| parts.iter().filter_map(|c| words(c["text"].as_str())).collect())
+            }
+            "reasoning" => p["summary"].as_array().map_or(vec![], |parts| parts.iter().filter_map(|c| words(c["text"].as_str())).collect()),
+            "function_call" if p["name"] == "update_plan" => {
+                let args: Value = p["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
+                vec![Event::Plan(PlanChange::Replace(plan_items(&args["plan"], &["step"])))]
+            }
+            "custom_tool_call" | "function_call" if p["name"] == "apply_patch" => {
+                let args: Value = p["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
+                let patch = p["input"].as_str().or(args["input"].as_str()).unwrap_or("");
+                let mut out = vec![Event::Tool { label: "Editing files".to_string() }];
+                out.extend(patched_files(patch));
+                out
+            }
+            "custom_tool_call" if p["name"] == "exec" && p["input"].is_string() => {
+                vec![Event::Tool { label: format!("Running {}", one_line(p["input"].as_str().unwrap_or(""), 60)) }]
+            }
             "function_call" | "custom_tool_call" => {
                 let args = p["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
                 vec![Event::Tool { label: tool_label(p["name"].as_str().unwrap_or(""), &args) }]
@@ -437,9 +845,15 @@ pub fn parse_hook(data: &Value) -> Vec<Event> {
         out.push(Event::Meta { cwd: cwd.to_string() });
     }
     match data["hook_event_name"].as_str().unwrap_or("") {
-        "UserPromptSubmit" => out.push(Event::Turn),
+        "UserPromptSubmit" => {
+            out.push(Event::Turn);
+            out.extend(data["prompt"].as_str().map(|p| Event::Prompt(prompt_line(p))));
+        }
         "PostToolUse" | "PostToolUseFailure" => out.push(Event::ToolDone),
-        "Stop" => out.push(Event::Done),
+        "Stop" => {
+            out.extend(words(data["last_assistant_message"].as_str()));
+            out.push(Event::Done);
+        }
         "StopFailure" => out.push(Event::Failed(one_line(data["error_type"].as_str().unwrap_or("Claude stopped with an error"), 80))),
         "SessionEnd" => out.push(Event::End),
         _ => {}
@@ -470,8 +884,8 @@ mod tests {
         let tool = r#"{"type":"assistant","cwd":"C:\\dev\\shop","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\dev\\shop\\a.rs"}}]}}"#;
         assert_eq!(parse_claude(tool), vec![Event::Meta { cwd: "C:\\dev\\shop".into() }, Event::Tool { label: "Reading a.rs".into() }]);
         let end = r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}"#;
-        assert_eq!(parse_claude(end), vec![Event::Done]);
-        assert_eq!(parse_claude(r#"{"type":"user","message":{"content":"fix it"}}"#), vec![Event::Turn]);
+        assert_eq!(parse_claude(end), vec![Event::Said("ok".into()), Event::Done]);
+        assert_eq!(parse_claude(r#"{"type":"user","message":{"content":"fix it"}}"#), vec![Event::Turn, Event::Prompt("fix it".into())]);
         assert_eq!(parse_claude(r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"x"}]}}"#), vec![Event::ToolDone]);
         assert_eq!(parse_claude(r#"{"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#), vec![Event::Interrupted]);
         assert_eq!(parse_claude(r#"{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}"#), vec![]);
@@ -489,7 +903,7 @@ mod tests {
     fn codex_rollout_lines() {
         assert_eq!(parse_codex(r#"{"type":"session_meta","payload":{"cwd":"C:\\dev\\x"}}"#), vec![Event::Meta { cwd: "C:\\dev\\x".into() }]);
         assert_eq!(parse_codex(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#), vec![Event::Turn]);
-        assert_eq!(parse_codex(r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"x"}}"#), vec![Event::Tool { label: "Running a command".into() }]);
+        assert_eq!(parse_codex(r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"npm test"}}"#), vec![Event::Tool { label: "Running npm test".into() }]);
         assert_eq!(
             parse_codex(r#"{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"cargo  test\"}"}}"#),
             vec![Event::Tool { label: "Running cargo test".into() }]
@@ -512,6 +926,152 @@ mod tests {
         assert_eq!(seen(&hub).status, Status::Done);
         assert_eq!(seen(&hub).elapsed_s, 8);
         assert_eq!(hub.finished_count, 1);
+    }
+
+    #[test]
+    fn thinking_alone_does_not_end_a_turn() {
+        let line = r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        assert_eq!(parse_claude(line), vec![Event::Said("hmm".into())]);
+        let redacted = r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":""}]}}"#;
+        assert_eq!(parse_claude(redacted), vec![]);
+    }
+
+    #[test]
+    fn questions_and_plans_wait_for_you() {
+        let ask = r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Blue or green?"}]}}]}}"#;
+        assert_eq!(parse_claude(ask), vec![Event::Said("Blue or green?".into()), Event::ExternalWait("Waiting for your answer".into())]);
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "s", NOW, Event::Turn, NOW);
+        hub.apply(Agent::Claude, "s", NOW, Event::Said("Which colour do you want?".into()), NOW);
+        hub.apply(Agent::Claude, "s", NOW, Event::Done, NOW);
+        assert_eq!(seen(&hub).status, Status::Waiting);
+        assert_eq!(seen(&hub).status_text(), "Needs you");
+        assert_eq!(hub.last_finished.as_ref().map(|f| f.2), Some(Status::Waiting));
+    }
+
+    #[test]
+    fn steps_follow_the_work() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Codex, "s", NOW, Event::Turn, NOW);
+        hub.apply(Agent::Codex, "s", NOW, Event::Tool { label: "a".into() }, NOW);
+        hub.apply(Agent::Codex, "s", NOW, Event::ToolDone, NOW);
+        hub.apply(Agent::Codex, "s", NOW, Event::Tool { label: "b".into() }, NOW);
+        let steps = seen(&hub).steps;
+        assert_eq!((steps[0].done, steps[1].done, steps[1].label.as_str()), (true, false, "b"));
+        hub.apply(Agent::Codex, "s", NOW, Event::Turn, NOW);
+        assert!(seen(&hub).steps.is_empty());
+    }
+
+    #[test]
+    fn a_silent_session_says_so() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "s", NOW - 45_000, Event::Turn, NOW);
+        assert!(seen(&hub).is_quiet());
+        assert_eq!(seen(&hub).status_text(), "Quiet for 45s");
+    }
+
+    #[test]
+    fn long_text_keeps_its_ending() {
+        assert_eq!(latest_words("**Fixed** the `bug`"), "Fixed the bug");
+        let long = format!("{}. The last sentence.", "word ".repeat(100));
+        assert!(latest_words(&long).ends_with("The last sentence."));
+        assert!(latest_words(&long).chars().count() <= 221);
+    }
+
+    fn run(hub: &mut Hub, events: Vec<Event>) {
+        for e in events {
+            hub.apply(Agent::Claude, "s", NOW, e, NOW);
+        }
+    }
+
+    #[test]
+    fn prompts_lose_reply_markers() {
+        assert_eq!(prompt_line("<!-- reply 5 -->\n> quoted\n\nthis is good"), "quoted this is good");
+        assert_eq!(prompt_line("plain"), "plain");
+        assert_eq!(prompt_line("<!-- unfinished"), "");
+    }
+
+    #[test]
+    fn the_desktop_plan_becomes_progress() {
+        let mut hub = Hub::default();
+        run(&mut hub, vec![Event::Turn]);
+        let replace = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__update_plan","input":{"items":[{"content":"One","status":"in_progress"},{"content":"Two","status":"pending"},{"content":"Three","status":"pending"}]}}]}}"#;
+        run(&mut hub, parse_claude(replace));
+        assert_eq!(seen(&hub).progress_line().as_deref(), Some("Step 1 of 3: One"));
+        let advance = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__update_plan","input":{"advance":true}}]}}"#;
+        run(&mut hub, parse_claude(advance));
+        assert_eq!(seen(&hub).progress_line().as_deref(), Some("Step 2 of 3: Two"));
+        let mark = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__ccd_turn__update_plan","input":{"done":[2],"start":3}}]}}"#;
+        run(&mut hub, parse_claude(mark));
+        assert_eq!(seen(&hub).progress_line().as_deref(), Some("Step 3 of 3: Three"));
+        assert!((seen(&hub).progress().unwrap() - 2.0 / 3.0).abs() < 0.01);
+        assert!(seen(&hub).steps.is_empty()); // plan updates are not work steps
+    }
+
+    #[test]
+    fn claude_tasks_and_todos_become_progress() {
+        let mut hub = Hub::default();
+        run(&mut hub, vec![Event::Turn]);
+        for name in ["A", "B"] {
+            let line = format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"TaskCreate","input":{{"subject":"{name}"}}}}]}}}}"#);
+            run(&mut hub, parse_claude(&line));
+        }
+        run(&mut hub, parse_claude(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#));
+        run(&mut hub, parse_claude(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","input":{"taskId":"2","status":"in_progress"}}]}}"#));
+        assert_eq!(seen(&hub).progress_line().as_deref(), Some("Step 2 of 2: B"));
+        run(&mut hub, parse_claude(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"X","status":"completed"}]}}]}}"#));
+        assert_eq!(seen(&hub).progress_line().as_deref(), Some("All 1 steps done"));
+    }
+
+    #[test]
+    fn codex_plans_patches_and_tests() {
+        let plan = parse_codex(r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"Fix\",\"status\":\"in_progress\"}]}"}}"#);
+        assert_eq!(plan, vec![Event::Plan(PlanChange::Replace(vec![PlanItem { text: "Fix".into(), state: PlanState::Active }]))]);
+        let patch = parse_codex(r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#);
+        assert_eq!(patch[1], Event::FileChanged("a.rs".into()));
+        let test = parse_codex(r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["cargo","test"],"exit_code":1}}}"#);
+        assert_eq!(test, vec![Event::TestResult(false)]);
+    }
+
+    #[test]
+    fn a_finished_run_sums_itself_up() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "s", NOW - 362_000, Event::Turn, NOW);
+        let edit = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\dev\\a.rs"}},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm test"}}]}}"#;
+        run(&mut hub, parse_claude(edit));
+        run(&mut hub, parse_claude(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]}}"#));
+        run(&mut hub, vec![Event::Done]);
+        assert_eq!(seen(&hub).summary(), "Changed 1 file · tests passed · took 6m 02s");
+    }
+
+    #[test]
+    fn the_pill_follows_the_agents() {
+        let mut hub = Hub::default();
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Quiet);
+        hub.apply(Agent::Claude, "a", NOW, Event::Turn, NOW);
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Working);
+        hub.apply(Agent::Claude, "a", NOW, Event::Done, NOW);
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Finished);
+        hub.acknowledge();
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Quiet);
+        hub.apply(Agent::Codex, "b", NOW, Event::Failed("x".into()), NOW);
+        hub.apply(Agent::Claude, "c", NOW, Event::Turn, NOW);
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Failed); // a failure outranks other work
+        hub.acknowledge();
+        assert_eq!(pill_state(&hub.view(NOW)), Pill::Working);
+    }
+
+    #[test]
+    fn viewed_results_leave_the_list_and_history_stays_quiet() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "old", NOW - 60_000, Event::Failed("x".into()), NOW);
+        assert!(hub.view(NOW).is_empty());
+        hub.apply(Agent::Claude, "a", NOW, Event::Done, NOW);
+        assert_eq!(hub.view(NOW).len(), 1);
+        hub.mark_viewed();
+        assert!(hub.view(NOW).is_empty());
+        hub.apply(Agent::Claude, "a", NOW + 1, Event::Turn, NOW + 1);
+        assert_eq!(hub.view(NOW + 1).len(), 1);
     }
 
     #[test]
@@ -559,7 +1119,7 @@ mod tests {
     fn allow_answers_the_held_request_once() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "Running npm i".into(), serde_json::json!({ "command": "npm i" }), responder, NOW);
+        hub.hold(Agent::Claude, "s", "Running npm i".into(), String::new(), serde_json::json!({ "command": "npm i" }), responder, NOW);
         assert!(seen(&hub).can_decide);
         assert_eq!(seen(&hub).status, Status::Waiting);
         assert!(hub.decide(Agent::Claude, "s", true));
@@ -575,7 +1135,7 @@ mod tests {
     fn answering_in_the_agent_window_releases_the_hold() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), Value::Null, responder, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, responder, NOW);
         hub.apply(Agent::Claude, "s", NOW + 10, Event::Tool { label: "parallel".into() }, NOW + 10);
         assert_eq!(seen(&hub).status, Status::Waiting); // a parallel tool does not answer the question
         hub.apply(Agent::Claude, "s", NOW + 20, Event::ToolDone, NOW + 20);
@@ -587,9 +1147,9 @@ mod tests {
     fn hanging_up_ends_only_that_request() {
         let mut hub = Hub::default();
         let (_, first) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), Value::Null, first, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, first, NOW);
         let (_, second) = answers();
-        hub.hold(Agent::Claude, "s", "y".into(), Value::Null, second, NOW + 5);
+        hub.hold(Agent::Claude, "s", "y".into(), String::new(), Value::Null, second, NOW + 5);
         assert!(!hub.hung_up(Agent::Claude, "s", NOW)); // the old request's connection closing changes nothing
         assert!(seen(&hub).can_decide);
         assert!(hub.hung_up(Agent::Claude, "s", NOW + 5));
@@ -600,7 +1160,7 @@ mod tests {
     fn a_forgotten_request_times_out() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), Value::Null, responder, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, responder, NOW);
         assert!(hub.expire(NOW + HOLD_MS + 1));
         assert_eq!(*log.lock().unwrap(), vec![None]);
     }

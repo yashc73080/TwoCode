@@ -72,7 +72,7 @@ pub fn show_menu(app: &mut App) {
         (ID_AGENTS, "Agent tracker", c.agents, true),
         (ID_CLAUDE, "    Follow Claude Code", c.track_claude, c.agents),
         (ID_CODEX, "    Follow Codex", c.track_codex, c.agents),
-        (ID_ALERTS, "    Show when an agent finishes", c.finish_alerts, c.agents),
+        (ID_ALERTS, "    Pop up when an agent finishes", c.finish_popup, c.agents),
         (ID_ALLOW, "    Allow or Deny from the notch (Claude Code)", allow_on, c.agents),
         (ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true),
         (ID_STARTUP, "Start with Windows", starts_with_windows(), true),
@@ -112,7 +112,7 @@ fn choose(app: &mut App, id: usize, allow_on: bool) {
         ID_AGENTS => c.agents = !c.agents,
         ID_CLAUDE => c.track_claude = !c.track_claude,
         ID_CODEX => c.track_codex = !c.track_codex,
-        ID_ALERTS => c.finish_alerts = !c.finish_alerts,
+        ID_ALERTS => c.finish_popup = !c.finish_popup,
         ID_FULLSCREEN => c.hide_fullscreen = !c.hide_fullscreen,
         ID_ALLOW => {
             if let Err(why) = hooks::set_installed(!allow_on, &app.secret) {

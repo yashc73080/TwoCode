@@ -88,11 +88,50 @@ pub struct App {
     region: (i32, i32),
     hidden_for_fullscreen: bool,
     was_deciding: bool,
+    selected: Option<(Agent, String)>,
+    auto_selected: bool,
+    viewed_agents: bool,
     dirty: bool,
     pub tray_message: u32,
 }
 
 impl App {
+    /// Opening the notch counts as seeing the pill's news. Closing it after looking
+    /// at the agents page lets finished work and errors leave the list.
+    fn note_viewing(&mut self, next: Mode) {
+        let opening = next == Mode::Open && self.mode != Mode::Open;
+        let closing = next != Mode::Open && self.mode == Mode::Open;
+        let viewed = closing && self.viewed_agents;
+        if let Ok(mut hub) = self.hub.lock() {
+            if opening || viewed {
+                hub.acknowledge();
+            }
+            if viewed {
+                hub.mark_viewed();
+            }
+        }
+        if closing {
+            self.viewed_agents = false;
+        }
+        if next == Mode::Open && self.config.tab == Tab::Agents {
+            self.viewed_agents = true;
+        }
+        if opening || viewed {
+            let all = self.hub.lock().map(|hub| hub.view(agents::now_ms())).unwrap_or_default();
+            self.sessions = self.visible_sessions(all);
+        }
+    }
+
+    fn selected_view(&self) -> Option<&SessionView> {
+        let (agent, id) = self.selected.as_ref()?;
+        self.sessions.iter().find(|s| s.agent == *agent && s.id == *id)
+    }
+
+    fn open_width(&self) -> f32 {
+        let lyrics = self.config.lyrics && !self.lyric_lines.is_empty() && self.media.present;
+        layout::open_width(self.config.tab, lyrics, self.selected_view().is_some())
+    }
+
     fn tabs(&self) -> Vec<Tab> {
         layout::tabs(self.config.media, self.config.agents)
     }
@@ -102,6 +141,16 @@ impl App {
         let deciding = self.needs_decision();
         if deciding && !self.was_deciding {
             self.config.tab = Tab::Agents;
+        }
+        // A question opens on that session, and moves on when it is answered.
+        let waiting = self.sessions.iter().find(|s| s.can_decide).map(|s| (s.agent, s.id.clone()));
+        let selected_decides = self.selected_view().is_some_and(|s| s.can_decide);
+        if deciding && !selected_decides && (!self.was_deciding || self.auto_selected) {
+            self.selected = waiting;
+            self.auto_selected = true;
+        } else if !deciding && self.was_deciding && self.auto_selected {
+            self.selected = None;
+            self.auto_selected = false;
         }
         self.was_deciding = deciding;
         let tabs = self.tabs();
@@ -156,8 +205,12 @@ impl App {
                 Agent::Claude => self.config.track_claude,
                 Agent::Codex => self.config.track_codex,
             };
-            if self.config.finish_alerts && self.config.agents && tracked {
-                let verb = if status == Status::Error { "hit an error" } else { "finished" };
+            if self.config.finish_popup && self.config.agents && tracked {
+                let verb = match status {
+                    Status::Error => "hit an error",
+                    Status::Waiting => "needs you",
+                    _ => "finished",
+                };
                 self.peek_text = format!("{} {verb} · {project}", agent.name());
                 self.peek_status = status;
                 self.flashing = true;
@@ -174,7 +227,11 @@ impl App {
     pub fn settle(&mut self) {
         self.pick_tab();
         let next = layout::target_mode(self.hovering, self.needs_decision(), self.flashing, !self.tabs().is_empty());
-        let to = layout::shape_for(next);
+        self.note_viewing(next);
+        if next == Mode::Rest {
+            self.selected = None;
+        }
+        let to = if next == Mode::Open { layout::open_shape(self.open_width()) } else { layout::shape_for(next) };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
             self.mode = next;
             self.motion = Some(Motion { from: self.shape, to, elapsed_ms: 0.0 });
@@ -272,6 +329,8 @@ impl App {
             media: &self.media,
             lyrics_on: self.config.lyrics,
             lyric_lines: &self.lyric_lines,
+            selected: self.selected.as_ref().and_then(|(agent, id)| self.sessions.iter().find(|s| s.agent == *agent && s.id == *id)),
+            pill: if self.config.agents { agents::pill_state(&self.sessions) } else { agents::Pill::Quiet },
             sessions: &self.sessions,
             peek: Some(&self.peek_text),
             peek_status: self.peek_status,
@@ -376,6 +435,18 @@ impl App {
             Some(Action::Allow(agent, id)) => self.answer(agent, &id, true),
             Some(Action::Deny(agent, id)) => self.answer(agent, &id, false),
             Some(Action::Tab(tab)) => self.choose_tab(tab),
+            Some(Action::Open(agent, id)) => {
+                self.selected = Some((agent, id));
+                self.auto_selected = false;
+                self.hovered = None;
+                self.settle();
+            }
+            Some(Action::Back) => {
+                self.selected = None;
+                self.auto_selected = false;
+                self.hovered = None;
+                self.settle();
+            }
             Some(Action::SeekTo(ms)) => drop(self.media_tx.send(Command::Seek(ms))),
             Some(Action::ToggleLyrics) => {
                 self.config.lyrics = !self.config.lyrics;
@@ -554,6 +625,9 @@ fn main() {
             region: (0, 0),
             hidden_for_fullscreen: false,
             was_deciding: false,
+            selected: None,
+            auto_selected: false,
+            viewed_agents: false,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));
