@@ -1,4 +1,5 @@
 //! Your switches, saved as a small JSON file in %APPDATA%\TwoCode.
+use crate::layout::Tab;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -11,13 +12,13 @@ pub struct Config {
     pub track_claude: bool,
     pub track_codex: bool,
     pub finish_alerts: bool,
-    pub minimal: bool,
     pub hide_fullscreen: bool,
+    pub tab: Tab,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { media: true, agents: true, track_claude: true, track_codex: true, finish_alerts: true, minimal: false, hide_fullscreen: true }
+        Config { media: true, agents: true, track_claude: true, track_codex: true, finish_alerts: true, hide_fullscreen: true, tab: Tab::Media }
     }
 }
 

@@ -1,7 +1,7 @@
 //! What the notch shows in each state, and which parts of it you can click.
 use crate::agents::{Agent, SessionView, Status};
 use crate::gfx::{Align, Gfx, Rect};
-use crate::layout::{self, Mode, Shape, CANVAS_W};
+use crate::layout::{self, Mode, Shape, Tab, CANVAS_W};
 use crate::media::Media;
 
 const WHITE: u32 = 0xFFFFFF;
@@ -22,15 +22,15 @@ pub enum Action {
     Seek { x: f32, w: f32, duration_ms: u64 },
     Allow(Agent, String),
     Deny(Agent, String),
+    Tab(Tab),
 }
 
 pub struct Scene<'a> {
     pub shape: Shape,
     pub mode: Mode,
     pub open_h: f32,
-    pub show_media: bool,
-    pub show_agents: bool,
-    pub minimal: bool,
+    pub tabs: &'a [Tab],
+    pub tab: Tab,
     pub media: &'a Media,
     pub sessions: &'a [SessionView],
     pub peek: Option<&'a str>,
@@ -51,77 +51,80 @@ fn status_colour(status: Status) -> u32 {
 pub fn draw(g: &mut Gfx, s: &Scene, hits: &mut Vec<(Rect, Action)>) {
     hits.clear();
     let left = (CANVAS_W - s.shape.w) / 2.0;
-    let area = Rect { x: left, y: 0.0, w: s.shape.w, h: s.shape.h };
-    // The top corners sit above the screen edge, so the notch grows out of the bezel.
-    g.fill(Rect { x: left, y: -s.shape.radius, w: s.shape.w, h: s.shape.h + s.shape.radius }, s.shape.radius, 0x000000, 1.0);
+    let area = Rect { x: left, y: s.shape.y, w: s.shape.w, h: s.shape.h };
+    // Bigger shapes grow out of the screen edge: their top corners slide above it as the gap closes.
+    let lift = s.shape.radius * (1.0 - s.shape.y / layout::shape_for(Mode::Rest).y).clamp(0.0, 1.0);
+    g.fill(Rect { x: left, y: s.shape.y - lift, w: s.shape.w, h: s.shape.h + lift }, s.shape.radius, 0x000000, 1.0);
     g.clip(area);
     let open = layout::content_alpha(s.shape.h, s.open_h);
     match s.mode {
         Mode::Open if open > 0.0 => draw_open(g, s, area, open, hits),
         Mode::Open => {}
-        Mode::Peek if s.shape.h > 30.0 => draw_peek(g, s, area),
+        Mode::Peek if s.shape.h > 22.0 => draw_peek(g, s, area),
         Mode::Peek => {}
-        Mode::Rest if s.minimal => draw_line(g, s, area),
-        Mode::Rest if s.shape.h < 40.0 => draw_rest(g, s, area),
+        Mode::Rest if s.shape.h < 12.0 => draw_pill(g, s, area),
         Mode::Rest => {}
     }
     g.unclip();
 }
 
 fn light(s: &Scene) -> Option<Status> {
-    if !s.show_agents {
+    if !s.tabs.contains(&Tab::Agents) {
         return None;
     }
     layout::light(s.sessions.iter().map(|v| v.status))
 }
 
-fn draw_line(g: &mut Gfx, s: &Scene, a: Rect) {
+/// Grey so it shows on dark and light windows. The left part lights up for agents, the right for music.
+fn draw_pill(g: &mut Gfx, s: &Scene, a: Rect) {
+    g.fill(a, a.h / 2.0, 0xFFFFFF, 0.34);
     if let Some(status) = light(s) {
-        g.fill(Rect { x: a.x + a.w / 2.0 - 18.0, y: a.h - 2.5, w: 36.0, h: 2.0 }, 1.0, status_colour(status), 1.0);
+        g.fill(Rect { w: a.w * 0.45, ..a }, a.h / 2.0, status_colour(status), 1.0);
     }
-}
-
-fn draw_rest(g: &mut Gfx, s: &Scene, a: Rect) {
-    let cy = a.h / 2.0;
-    if let Some(status) = light(s) {
-        g.circle(a.x + 20.0, cy, 4.0, status_colour(status), 1.0);
-        let count = s.sessions.iter().filter(|v| v.status == Status::Running || v.status == Status::Waiting).count();
-        if count > 1 {
-            g.text(&count.to_string(), Rect { x: a.x + 28.0, y: 0.0, w: 22.0, h: a.h }, 11.0, true, Align::Left, MUTED, 1.0);
-        }
-    }
-    if s.show_media && s.media.playing {
-        bars(g, a.x + a.w - 34.0, cy);
-    }
-}
-
-/// A still level meter. It does not dance, because a moving picture would keep the graphics card awake.
-fn bars(g: &mut Gfx, x: f32, cy: f32) {
-    for (i, h) in [6.0, 11.0, 8.0, 12.0].iter().enumerate() {
-        g.fill(Rect { x: x + i as f32 * 4.5, y: cy - h / 2.0, w: 2.5, h: *h }, 1.2, WHITE, 0.85);
+    if s.tabs.contains(&Tab::Media) && s.media.playing {
+        g.fill(Rect { x: a.x + a.w * 0.7, w: a.w * 0.3, ..a }, a.h / 2.0, WHITE, 0.95);
     }
 }
 
 fn draw_peek(g: &mut Gfx, s: &Scene, a: Rect) {
     let Some(text) = s.peek else { return };
-    g.circle(a.x + 24.0, a.h / 2.0, 5.0, status_colour(s.peek_status), 1.0);
-    g.text(text, Rect { x: a.x + 38.0, y: 0.0, w: a.w - 54.0, h: a.h }, 13.0, true, Align::Left, WHITE, 1.0);
+    g.circle(a.x + 20.0, a.h / 2.0, 4.0, status_colour(s.peek_status), 1.0);
+    g.text(text, Rect { x: a.x + 32.0, y: 0.0, w: a.w - 46.0, h: a.h }, 12.0, true, Align::Left, WHITE, 1.0);
 }
 
 fn draw_open(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
     let pad = 20.0;
-    let top = 14.0;
-    let body = Rect { x: a.x + pad, y: top, w: a.w - pad * 2.0, h: s.open_h - top - 14.0 };
-    match (s.show_media, s.show_agents) {
-        (true, true) => {
-            let music_w = 290.0;
-            draw_music(g, s, Rect { w: music_w, ..body }, alpha, hits);
-            g.fill(Rect { x: body.x + music_w + 14.0, y: body.y + 4.0, w: 1.0, h: body.h - 8.0 }, 0.0, WHITE, 0.09 * alpha);
-            draw_agents(g, s, Rect { x: body.x + music_w + 29.0, w: body.w - music_w - 29.0, ..body }, alpha, hits);
+    let mut top = 14.0;
+    if s.tabs.len() > 1 {
+        draw_tabs(g, s, a, alpha, hits);
+        top = 44.0;
+    }
+    let body = Rect { x: a.x + pad, y: top, w: a.w - pad * 2.0, h: s.open_h - top - 12.0 };
+    match s.tab {
+        Tab::Media => draw_music(g, s, body, alpha, hits),
+        Tab::Agents => draw_agents(g, s, body, alpha, hits),
+    }
+}
+
+fn draw_tabs(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let (w, h, gap) = (76.0, 26.0, 4.0);
+    let total = s.tabs.len() as f32 * (w + gap) - gap;
+    for (i, tab) in s.tabs.iter().enumerate() {
+        let r = Rect { x: a.x + (a.w - total) / 2.0 + i as f32 * (w + gap), y: 10.0, w, h };
+        let action = Action::Tab(*tab);
+        let chosen = *tab == s.tab;
+        let fill = if chosen { 0.16 } else if is_hovered(s, &action) { 0.08 } else { 0.0 };
+        if fill > 0.0 {
+            g.fill(r, h / 2.0, WHITE, fill * alpha);
         }
-        (true, false) => draw_music(g, s, body, alpha, hits),
-        (false, true) => draw_agents(g, s, body, alpha, hits),
-        _ => {}
+        g.text(tab.label(), r, 12.0, true, Align::Center, if chosen { WHITE } else { MUTED }, alpha);
+        // Agents needing attention show on their tab while another tab is open.
+        if *tab == Tab::Agents && !chosen {
+            if let Some(status) = light(s) {
+                g.circle(r.x + w - 14.0, r.y + h / 2.0, 3.0, status_colour(status), alpha);
+            }
+        }
+        hits.push((r, action));
     }
 }
 

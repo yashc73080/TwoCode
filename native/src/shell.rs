@@ -57,7 +57,6 @@ const ID_CLAUDE: usize = 3;
 const ID_CODEX: usize = 4;
 const ID_ALERTS: usize = 5;
 const ID_ALLOW: usize = 6;
-const ID_MINIMAL: usize = 7;
 const ID_FULLSCREEN: usize = 8;
 const ID_STARTUP: usize = 9;
 const ID_EXIT: usize = 10;
@@ -65,14 +64,13 @@ const ID_EXIT: usize = 10;
 pub fn show_menu(app: &mut App) {
     let allow_on = hooks::installed(&app.secret);
     let c = app.config.clone();
-    let items: [(usize, &str, bool, bool); 9] = [
+    let items: [(usize, &str, bool, bool); 8] = [
         (ID_MEDIA, "Media player", c.media, true),
         (ID_AGENTS, "Agent tracker", c.agents, true),
         (ID_CLAUDE, "    Follow Claude Code", c.track_claude, c.agents),
         (ID_CODEX, "    Follow Codex", c.track_codex, c.agents),
         (ID_ALERTS, "    Show when an agent finishes", c.finish_alerts, c.agents),
         (ID_ALLOW, "    Allow or Deny from the notch (Claude Code)", allow_on, c.agents),
-        (ID_MINIMAL, "Minimal notch", c.minimal, true),
         (ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true),
         (ID_STARTUP, "Start with Windows", starts_with_windows(), true),
     ];
@@ -88,7 +86,7 @@ pub fn show_menu(app: &mut App) {
                 flags |= MF_GRAYED;
             }
             let _ = AppendMenuW(menu, flags, *id, PCWSTR(wide.as_ptr()));
-            if i == 5 || i == 8 {
+            if i == 5 || i == 7 {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
         }
@@ -111,7 +109,6 @@ fn choose(app: &mut App, id: usize, allow_on: bool) {
         ID_CLAUDE => c.track_claude = !c.track_claude,
         ID_CODEX => c.track_codex = !c.track_codex,
         ID_ALERTS => c.finish_alerts = !c.finish_alerts,
-        ID_MINIMAL => c.minimal = !c.minimal,
         ID_FULLSCREEN => c.hide_fullscreen = !c.hide_fullscreen,
         ID_ALLOW => {
             if let Err(why) = hooks::set_installed(!allow_on, &app.secret) {

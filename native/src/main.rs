@@ -13,7 +13,7 @@ mod watcher;
 use agents::{Agent, Hub, SessionView, Status};
 use config::Config;
 use gfx::{Gfx, Rect};
-use layout::{Mode, Modules, Motion, Shape, CANVAS_H, CANVAS_W};
+use layout::{Mode, Motion, Shape, Tab, CANVAS_H, CANVAS_W};
 use media::{Command, Media};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -81,13 +81,29 @@ pub struct App {
     hovered: Option<Action>,
     region: (i32, i32),
     hidden_for_fullscreen: bool,
+    was_deciding: bool,
     dirty: bool,
     pub tray_message: u32,
 }
 
 impl App {
-    fn modules(&self) -> Modules {
-        Modules { media: self.config.media, agents: self.config.agents, minimal: self.config.minimal }
+    fn tabs(&self) -> Vec<Tab> {
+        layout::tabs(self.config.media, self.config.agents)
+    }
+
+    /// The tab to show: a question brings you to the agents, and a switched-off feature gives up its tab.
+    fn pick_tab(&mut self) {
+        let deciding = self.needs_decision();
+        if deciding && !self.was_deciding {
+            self.config.tab = Tab::Agents;
+        }
+        self.was_deciding = deciding;
+        let tabs = self.tabs();
+        if !tabs.contains(&self.config.tab) {
+            if let Some(first) = tabs.first() {
+                self.config.tab = *first;
+            }
+        }
     }
 
     fn visible_sessions(&self, all: Vec<SessionView>) -> Vec<SessionView> {
@@ -146,8 +162,9 @@ impl App {
 
     /// Starts moving toward whatever the notch should be now.
     pub fn settle(&mut self) {
-        let next = layout::target_mode(self.hovering, self.needs_decision(), self.flashing);
-        let to = layout::shape_for(next, &self.modules());
+        self.pick_tab();
+        let next = layout::target_mode(self.hovering, self.needs_decision(), self.flashing, !self.tabs().is_empty());
+        let to = layout::shape_for(next);
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
             self.mode = next;
             self.motion = Some(Motion { from: self.shape, to, elapsed_ms: 0.0 });
@@ -166,7 +183,9 @@ impl App {
     /// Only the notch itself catches the mouse; everywhere else clicks reach the windows below.
     fn update_region(&mut self) {
         let scale = self.gfx.as_ref().map_or(1.0, |g| g.scale);
-        let (w, h) = ((self.shape.w * scale).ceil() as i32 + 2, (self.shape.h * scale).ceil() as i32 + 1);
+        // The pill is too thin to aim for, so its mouse area is a little bigger than what you see, up to the screen edge.
+        let (reach_w, reach_h) = if self.shape.h < 12.0 { (16.0, 3.0) } else { (0.0, 0.0) };
+        let (w, h) = (((self.shape.w + reach_w) * scale).ceil() as i32 + 2, ((self.shape.y + self.shape.h + reach_h) * scale).ceil() as i32 + 1);
         if (w, h) == self.region {
             return;
         }
@@ -191,7 +210,8 @@ impl App {
         }
         // A growing notch needs its room before the frame appears, a shrinking one gives it back after.
         self.update_region();
-        let open_h = layout::shape_for(Mode::Open, &self.modules()).h;
+        let open_h = layout::shape_for(Mode::Open).h;
+        let tabs = self.tabs();
         let Some(gfx) = self.gfx.as_mut() else {
             self.dirty = false;
             return;
@@ -200,9 +220,8 @@ impl App {
             shape: self.shape,
             mode: self.mode,
             open_h,
-            show_media: self.config.media,
-            show_agents: self.config.agents,
-            minimal: self.config.minimal,
+            tabs: &tabs,
+            tab: self.config.tab,
             media: &self.media,
             sessions: &self.sessions,
             peek: Some(&self.peek_text),
@@ -307,6 +326,12 @@ impl App {
             }
             Some(Action::Allow(agent, id)) => self.answer(agent, &id, true),
             Some(Action::Deny(agent, id)) => self.answer(agent, &id, false),
+            Some(Action::Tab(tab)) => {
+                self.config.tab = tab;
+                self.config.save();
+                self.hovered = None;
+                self.dirty = true;
+            }
             None => {}
         }
     }
@@ -442,8 +467,7 @@ fn main() {
         watcher::start(hub.clone(), tell_window);
         let media_tx = media::start(media_state.clone(), tell_window);
 
-        let modules = Modules { media: config.media, agents: config.agents, minimal: config.minimal };
-        let start = layout::shape_for(Mode::Rest, &modules);
+        let start = layout::shape_for(Mode::Rest);
         let app = Box::into_raw(Box::new(App {
             hwnd,
             gfx: None,
@@ -468,6 +492,7 @@ fn main() {
             hovered: None,
             region: (0, 0),
             hidden_for_fullscreen: false,
+            was_deciding: false,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

@@ -1,5 +1,6 @@
 //! The notch's sizes and motion. Measured in device-independent pixels; no Windows calls, so it can be tested.
 use crate::agents::Status;
+use serde::{Deserialize, Serialize};
 
 pub const CANVAS_W: f32 = 720.0;
 pub const CANVAS_H: f32 = 240.0;
@@ -17,31 +18,50 @@ pub struct Shape {
     pub w: f32,
     pub h: f32,
     pub radius: f32,
+    /// Gap above the shape. The pill floats just below the screen edge; open shapes grow out of it.
+    pub y: f32,
 }
 
-pub struct Modules {
-    pub media: bool,
-    pub agents: bool,
-    pub minimal: bool,
+/// One page of the open notch. A new feature adds a value here and its place in `tabs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Tab {
+    #[default]
+    Media,
+    Agents,
 }
 
-pub fn shape_for(mode: Mode, m: &Modules) -> Shape {
+impl Tab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Media => "Media",
+            Tab::Agents => "Agents",
+        }
+    }
+}
+
+pub fn tabs(media: bool, agents: bool) -> Vec<Tab> {
+    let mut list = vec![];
+    if media {
+        list.push(Tab::Media);
+    }
+    if agents {
+        list.push(Tab::Agents);
+    }
+    list
+}
+
+pub fn shape_for(mode: Mode) -> Shape {
     match mode {
-        Mode::Rest if m.minimal => Shape { w: 190.0, h: 5.0, radius: 3.0 },
-        Mode::Rest => Shape { w: 150.0, h: 26.0, radius: 11.0 },
-        Mode::Peek => Shape { w: 340.0, h: 40.0, radius: 16.0 },
-        Mode::Open => match (m.media, m.agents) {
-            (true, true) => Shape { w: 680.0, h: 184.0, radius: 26.0 },
-            (true, false) => Shape { w: 350.0, h: 184.0, radius: 26.0 },
-            _ => Shape { w: 410.0, h: 184.0, radius: 26.0 },
-        },
+        Mode::Rest => Shape { w: 110.0, h: 5.0, radius: 2.5, y: 3.0 },
+        Mode::Peek => Shape { w: 280.0, h: 30.0, radius: 13.0, y: 0.0 },
+        Mode::Open => Shape { w: 460.0, h: 210.0, radius: 24.0, y: 0.0 },
     }
 }
 
 /// What the notch should be doing right now. Only the mouse or a question can hold it open,
 /// so a busy agent or playing music can never stop it from collapsing.
-pub fn target_mode(hovering: bool, needs_decision: bool, flashing: bool) -> Mode {
-    if hovering || needs_decision {
+pub fn target_mode(hovering: bool, needs_decision: bool, flashing: bool, has_tabs: bool) -> Mode {
+    if (hovering && has_tabs) || needs_decision {
         Mode::Open
     } else if flashing {
         Mode::Peek
@@ -72,7 +92,7 @@ impl Motion {
             1.0 - (1.0 - t).powi(3)
         };
         let mix = |a: f32, b: f32| a + (b - a) * eased;
-        Shape { w: mix(self.from.w, self.to.w), h: mix(self.from.h, self.to.h), radius: mix(self.from.radius, self.to.radius) }
+        Shape { w: mix(self.from.w, self.to.w), h: mix(self.from.h, self.to.h), radius: mix(self.from.radius, self.to.radius), y: mix(self.from.y, self.to.y).max(0.0) }
     }
 }
 
@@ -111,29 +131,41 @@ mod tests {
 
     #[test]
     fn it_always_collapses_when_nothing_holds_it() {
-        assert_eq!(target_mode(false, false, false), Mode::Rest);
-        assert_eq!(target_mode(true, false, false), Mode::Open);
-        assert_eq!(target_mode(false, true, false), Mode::Open);
-        assert_eq!(target_mode(false, false, true), Mode::Peek);
+        assert_eq!(target_mode(false, false, false, true), Mode::Rest);
+        assert_eq!(target_mode(true, false, false, true), Mode::Open);
+        assert_eq!(target_mode(false, true, false, true), Mode::Open);
+        assert_eq!(target_mode(false, false, true, true), Mode::Peek);
+    }
+
+    #[test]
+    fn hovering_opens_nothing_without_a_feature() {
+        assert_eq!(target_mode(true, false, false, false), Mode::Rest);
+    }
+
+    #[test]
+    fn the_pill_stays_tiny() {
+        let pill = shape_for(Mode::Rest);
+        assert!(pill.h + pill.y <= 8.0 && pill.w <= 120.0);
+    }
+
+    #[test]
+    fn tabs_follow_the_switches() {
+        assert_eq!(tabs(true, true), vec![Tab::Media, Tab::Agents]);
+        assert_eq!(tabs(false, true), vec![Tab::Agents]);
+        assert!(tabs(false, false).is_empty());
     }
 
     #[test]
     fn every_shape_fits_the_canvas() {
-        for (media, agents) in [(true, true), (true, false), (false, true)] {
-            for minimal in [false, true] {
-                let m = Modules { media, agents, minimal };
-                for mode in [Mode::Rest, Mode::Peek, Mode::Open] {
-                    let s = shape_for(mode, &m);
-                    assert!(s.w * 1.03 < CANVAS_W && s.h * 1.1 < CANVAS_H, "{mode:?} {s:?}");
-                }
-            }
+        for mode in [Mode::Rest, Mode::Peek, Mode::Open] {
+            let s = shape_for(mode);
+            assert!(s.w * 1.03 < CANVAS_W && s.h * 1.1 < CANVAS_H, "{mode:?} {s:?}");
         }
     }
 
     #[test]
     fn motion_starts_and_ends_exactly() {
-        let m = Modules { media: true, agents: true, minimal: false };
-        let (from, to) = (shape_for(Mode::Rest, &m), shape_for(Mode::Open, &m));
+        let (from, to) = (shape_for(Mode::Rest), shape_for(Mode::Open));
         assert_eq!(Motion { from, to, elapsed_ms: 0.0 }.current().h.round(), from.h);
         let done = Motion { from, to, elapsed_ms: 500.0 };
         assert!(done.finished());
