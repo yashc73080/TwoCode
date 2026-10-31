@@ -54,9 +54,10 @@ pub struct Gfx {
     _visual: IDCompositionVisual,
     brush: ID2D1SolidColorBrush,
     dwrite: IDWriteFactory,
-    formats: HashMap<(u32, bool, Align), IDWriteTextFormat>,
+    formats: HashMap<(u32, bool, Align, bool), IDWriteTextFormat>,
     art: Option<(u64, ID2D1BitmapBrush1)>,
     art_size: (f32, f32),
+    art_colour: Option<u32>,
     pub scale: f32,
 }
 
@@ -125,6 +126,7 @@ impl Gfx {
                 formats: HashMap::new(),
                 art: None,
                 art_size: (1.0, 1.0),
+                art_colour: None,
                 scale,
             })
         }
@@ -189,7 +191,16 @@ impl Gfx {
     }
 
     pub fn text(&mut self, text: &str, r: Rect, size: f32, bold: bool, align: Align, hex: u32, alpha: f32) {
-        let Some(format) = self.format(size, bold, align) else { return };
+        self.draw_text(text, r, size, bold, align, false, hex, alpha);
+    }
+
+    pub fn text_wrapped(&mut self, text: &str, r: Rect, size: f32, bold: bool, align: Align, hex: u32, alpha: f32) {
+        self.draw_text(text, r, size, bold, align, true, hex, alpha);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(&mut self, text: &str, r: Rect, size: f32, bold: bool, align: Align, wrap: bool, hex: u32, alpha: f32) {
+        let Some(format) = self.format(size, bold, align, wrap) else { return };
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             self.brush.SetColor(&colour(hex, alpha));
@@ -197,8 +208,8 @@ impl Gfx {
         }
     }
 
-    fn format(&mut self, size: f32, bold: bool, align: Align) -> Option<IDWriteTextFormat> {
-        let key = ((size * 10.0) as u32, bold, align);
+    fn format(&mut self, size: f32, bold: bool, align: Align, wrap: bool) -> Option<IDWriteTextFormat> {
+        let key = ((size * 10.0) as u32, bold, align, wrap);
         if let Some(found) = self.formats.get(&key) {
             return Some(found.clone());
         }
@@ -207,7 +218,7 @@ impl Gfx {
                 let weight = if bold { DWRITE_FONT_WEIGHT_SEMI_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
                 let font: PCWSTR = w!("Segoe UI");
                 let format = self.dwrite.CreateTextFormat(font, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!(""))?;
-                format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                format.SetWordWrapping(if wrap { DWRITE_WORD_WRAPPING_WRAP } else { DWRITE_WORD_WRAPPING_NO_WRAP })?;
                 format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 format.SetTextAlignment(match align {
                     Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -231,6 +242,9 @@ impl Gfx {
             return;
         }
         let brush = bytes.and_then(|b| self.decode(b).ok());
+        if brush.is_none() {
+            self.art_colour = None;
+        }
         self.art = brush.map(|b| (rev, b));
     }
 
@@ -256,8 +270,36 @@ impl Gfx {
             converter.Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
             let bitmap = self.dc.CreateBitmapFromWicBitmap(&converter, None)?;
             self.art_size = (out_w as f32, out_h as f32);
+            // One pixel of the cover is its average colour, used for the glow behind the music page.
+            let tiny = wic.CreateBitmapScaler()?;
+            tiny.Initialize(&frame, 1, 1, WICBitmapInterpolationModeFant)?;
+            let tiny_rgb = wic.CreateFormatConverter()?;
+            tiny_rgb.Initialize(&tiny, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+            let mut pixel = [0u8; 4];
+            tiny_rgb.CopyPixels(std::ptr::null(), 4, &mut pixel)?;
+            self.art_colour = Some(((pixel[2] as u32) << 16) | ((pixel[1] as u32) << 8) | pixel[0] as u32);
             let bitmap: ID2D1Bitmap = bitmap.cast()?;
             self.dc.CreateBitmapBrush(&bitmap, None, None)
+        }
+    }
+
+    /// The cover's colour rising from the bottom edge, black at the top where the screen ends.
+    pub fn tint(&self, r: Rect, radius: f32, alpha: f32) {
+        let Some(hex) = self.art_colour else { return };
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.25, color: colour(hex, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: colour(hex, 0.5 * alpha) },
+        ];
+        unsafe {
+            let target: &ID2D1RenderTarget = &self.dc;
+            let Ok(collection) = target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: point((r.x, r.y)),
+                endPoint: point((r.x, r.y + r.h)),
+            };
+            let Ok(brush) = target.CreateLinearGradientBrush(&line, None, &collection) else { return };
+            let rounded = D2D1_ROUNDED_RECT { rect: d2d_rect(r), radiusX: radius, radiusY: radius };
+            self.dc.FillRoundedRectangle(&rounded, &brush);
         }
     }
 

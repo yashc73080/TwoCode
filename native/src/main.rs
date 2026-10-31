@@ -5,6 +5,7 @@ mod config;
 mod gfx;
 mod hooks;
 mod layout;
+mod lyrics;
 mod media;
 mod shell;
 mod view;
@@ -40,6 +41,7 @@ const TIMER_TICK: usize = 3;
 const TIMER_FLASH: usize = 4;
 const TIMER_FULLSCREEN: usize = 5;
 const TIMER_RETRY: usize = 6;
+const WM_WHEEL: u32 = 0x020A;
 const OPEN_DELAY_MS: u32 = 110;
 const CLOSE_DELAY_MS: u32 = 320;
 const FLASH_MS: u32 = 4000;
@@ -64,6 +66,10 @@ pub struct App {
     hub: Arc<Mutex<Hub>>,
     media_state: Arc<Mutex<Media>>,
     media_tx: Sender<Command>,
+    lyrics_store: Arc<Mutex<lyrics::Store>>,
+    lyrics_tx: Sender<lyrics::Request>,
+    lyrics_asked: String,
+    lyric_lines: Arc<Vec<lyrics::Line>>,
     pub secret: String,
     media: Media,
     sessions: Vec<SessionView>,
@@ -141,6 +147,10 @@ impl App {
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.set_art(self.media.art_rev, self.media.art.as_deref().map(|v| v.as_slice()));
         }
+        if let Ok(store) = self.lyrics_store.lock() {
+            let key = song_key(&self.media);
+            self.lyric_lines = if store.key == key { store.lines.clone() } else { Arc::default() };
+        }
         if let Some((agent, project, status)) = finished {
             let tracked = match agent {
                 Agent::Claude => self.config.track_claude,
@@ -170,9 +180,12 @@ impl App {
             self.motion = Some(Motion { from: self.shape, to, elapsed_ms: 0.0 });
             self.last_frame = Instant::now();
         }
+        self.ask_for_lyrics();
         unsafe {
             if next == Mode::Open {
-                SetTimer(Some(self.hwnd), TIMER_TICK, 1000, None);
+                // Quick enough for a lyric line to change on time; slower when nothing depends on it.
+                let singing = self.config.tab == Tab::Media && self.config.lyrics && self.media.playing && !self.lyric_lines.is_empty();
+                SetTimer(Some(self.hwnd), TIMER_TICK, if singing { 200 } else { 1000 }, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), TIMER_TICK);
             }
@@ -180,11 +193,45 @@ impl App {
         self.dirty = true;
     }
 
+    /// Lyrics are only asked for while you are looking at the media page, once per song.
+    fn ask_for_lyrics(&mut self) {
+        let looking = self.mode == Mode::Open && self.config.tab == Tab::Media && self.config.media && self.config.lyrics;
+        let key = song_key(&self.media);
+        if !looking || !self.media.present || self.media.title.is_empty() || key == self.lyrics_asked {
+            return;
+        }
+        self.lyrics_asked = key.clone();
+        let _ = self.lyrics_tx.send(lyrics::Request {
+            key,
+            title: self.media.title.clone(),
+            artist: self.media.artist.clone(),
+            album: self.media.album.clone(),
+            duration_ms: self.media.duration_ms,
+        });
+    }
+
+    fn next_tab(&mut self, forward: bool) {
+        let tabs = self.tabs();
+        if tabs.len() < 2 {
+            return;
+        }
+        let at = tabs.iter().position(|t| *t == self.config.tab).unwrap_or(0);
+        let next = if forward { (at + 1) % tabs.len() } else { (at + tabs.len() - 1) % tabs.len() };
+        self.choose_tab(tabs[next]);
+    }
+
+    fn choose_tab(&mut self, tab: Tab) {
+        self.config.tab = tab;
+        self.config.save();
+        self.hovered = None;
+        self.settle();
+    }
+
     /// Only the notch itself catches the mouse; everywhere else clicks reach the windows below.
     fn update_region(&mut self) {
         let scale = self.gfx.as_ref().map_or(1.0, |g| g.scale);
         // The pill is too thin to aim for, so its mouse area is a little bigger than what you see, up to the screen edge.
-        let (reach_w, reach_h) = if self.shape.h < 12.0 { (16.0, 3.0) } else { (0.0, 0.0) };
+        let (reach_w, reach_h) = if self.shape.h < 12.0 { (28.0, 5.0) } else { (0.0, 0.0) };
         let (w, h) = (((self.shape.w + reach_w) * scale).ceil() as i32 + 2, ((self.shape.y + self.shape.h + reach_h) * scale).ceil() as i32 + 1);
         if (w, h) == self.region {
             return;
@@ -223,6 +270,8 @@ impl App {
             tabs: &tabs,
             tab: self.config.tab,
             media: &self.media,
+            lyrics_on: self.config.lyrics,
+            lyric_lines: &self.lyric_lines,
             sessions: &self.sessions,
             peek: Some(&self.peek_text),
             peek_status: self.peek_status,
@@ -326,11 +375,12 @@ impl App {
             }
             Some(Action::Allow(agent, id)) => self.answer(agent, &id, true),
             Some(Action::Deny(agent, id)) => self.answer(agent, &id, false),
-            Some(Action::Tab(tab)) => {
-                self.config.tab = tab;
+            Some(Action::Tab(tab)) => self.choose_tab(tab),
+            Some(Action::SeekTo(ms)) => drop(self.media_tx.send(Command::Seek(ms))),
+            Some(Action::ToggleLyrics) => {
+                self.config.lyrics = !self.config.lyrics;
                 self.config.save();
-                self.hovered = None;
-                self.dirty = true;
+                self.settle();
             }
             None => {}
         }
@@ -391,6 +441,10 @@ impl App {
     }
 }
 
+fn song_key(media: &Media) -> String {
+    format!("{}\u{1}{}", media.title, media.artist)
+}
+
 unsafe fn app<'a>(hwnd: HWND) -> Option<&'a mut App> {
     (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App).as_mut()
 }
@@ -413,6 +467,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => app.mouse_move(lparam),
         WM_MOUSELEAVE => app.mouse_leave(),
         WM_LBUTTONUP => app.click(lparam),
+        WM_WHEEL => app.next_tab(((wparam.0 >> 16) as u16 as i16) < 0),
         WM_RBUTTONUP => shell::show_menu(app),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR => {
@@ -466,6 +521,8 @@ fn main() {
         hooks::serve(hub.clone(), secret.clone(), tell_window);
         watcher::start(hub.clone(), tell_window);
         let media_tx = media::start(media_state.clone(), tell_window);
+        let lyrics_store = Arc::new(Mutex::new(lyrics::Store::default()));
+        let lyrics_tx = lyrics::start(lyrics_store.clone(), tell_window);
 
         let start = layout::shape_for(Mode::Rest);
         let app = Box::into_raw(Box::new(App {
@@ -475,6 +532,10 @@ fn main() {
             hub,
             media_state,
             media_tx,
+            lyrics_store,
+            lyrics_tx,
+            lyrics_asked: String::new(),
+            lyric_lines: Arc::default(),
             secret,
             media: Media::default(),
             sessions: vec![],

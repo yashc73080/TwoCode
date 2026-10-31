@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     pub media: bool,
+    pub lyrics: bool,
     pub agents: bool,
     pub track_claude: bool,
     pub track_codex: bool,
@@ -18,7 +19,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { media: true, agents: true, track_claude: true, track_codex: true, finish_alerts: true, hide_fullscreen: true, tab: Tab::Media }
+        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_alerts: true, hide_fullscreen: true, tab: Tab::Media }
     }
 }
 

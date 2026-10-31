@@ -2,8 +2,8 @@
 use crate::agents::Status;
 use serde::{Deserialize, Serialize};
 
-pub const CANVAS_W: f32 = 720.0;
-pub const CANVAS_H: f32 = 240.0;
+pub const CANVAS_W: f32 = 640.0;
+pub const CANVAS_H: f32 = 170.0;
 const DURATION_MS: f32 = 240.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,9 +52,9 @@ pub fn tabs(media: bool, agents: bool) -> Vec<Tab> {
 
 pub fn shape_for(mode: Mode) -> Shape {
     match mode {
-        Mode::Rest => Shape { w: 110.0, h: 5.0, radius: 2.5, y: 3.0 },
+        Mode::Rest => Shape { w: 56.0, h: 4.0, radius: 2.0, y: 2.0 },
         Mode::Peek => Shape { w: 280.0, h: 30.0, radius: 13.0, y: 0.0 },
-        Mode::Open => Shape { w: 460.0, h: 210.0, radius: 24.0, y: 0.0 },
+        Mode::Open => Shape { w: 600.0, h: 136.0, radius: 22.0, y: 0.0 },
     }
 }
 
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn the_pill_stays_tiny() {
         let pill = shape_for(Mode::Rest);
-        assert!(pill.h + pill.y <= 8.0 && pill.w <= 120.0);
+        assert!(pill.h + pill.y <= 6.0 && pill.w <= 60.0);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub struct Media {
     pub present: bool,
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub app: String,
     pub playing: bool,
     pub can_seek: bool,
@@ -216,6 +217,7 @@ fn read(manager: &Manager, state: &Mutex<Media>, art_key: &mut String, art_found
     media.present = true;
     media.title = title;
     media.artist = artist;
+    media.album = props.AlbumTitle().map(|t| t.to_string()).unwrap_or_default();
     media.app = session.SourceAppUserModelId().map(|s| app_name(&s.to_string())).unwrap_or_default();
     media.playing = playing;
     media.can_seek = info.Controls().and_then(|c| c.IsPlaybackPositionEnabled()).unwrap_or(false);

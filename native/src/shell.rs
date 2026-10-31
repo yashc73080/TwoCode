@@ -33,7 +33,8 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
         hIcon: load_icon(),
         ..Default::default()
     };
-    for (slot, unit) in data.szTip.iter_mut().zip("TwoCode".encode_utf16()) {
+    let tip = format!("TwoCode (build {})", option_env!("TWOCODE_BUILD").unwrap_or("dev"));
+    for (slot, unit) in data.szTip.iter_mut().zip(tip.encode_utf16()) {
         *slot = unit;
     }
     data
@@ -60,12 +61,14 @@ const ID_ALLOW: usize = 6;
 const ID_FULLSCREEN: usize = 8;
 const ID_STARTUP: usize = 9;
 const ID_EXIT: usize = 10;
+const ID_LYRICS: usize = 11;
 
 pub fn show_menu(app: &mut App) {
     let allow_on = hooks::installed(&app.secret);
     let c = app.config.clone();
-    let items: [(usize, &str, bool, bool); 8] = [
+    let items: [(usize, &str, bool, bool); 9] = [
         (ID_MEDIA, "Media player", c.media, true),
+        (ID_LYRICS, "    Lyrics (from LRCLIB)", c.lyrics, c.media),
         (ID_AGENTS, "Agent tracker", c.agents, true),
         (ID_CLAUDE, "    Follow Claude Code", c.track_claude, c.agents),
         (ID_CODEX, "    Follow Codex", c.track_codex, c.agents),
@@ -86,7 +89,7 @@ pub fn show_menu(app: &mut App) {
                 flags |= MF_GRAYED;
             }
             let _ = AppendMenuW(menu, flags, *id, PCWSTR(wide.as_ptr()));
-            if i == 5 || i == 7 {
+            if i == 6 || i == 8 {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
         }
@@ -105,6 +108,7 @@ fn choose(app: &mut App, id: usize, allow_on: bool) {
     let c = &mut app.config;
     match id {
         ID_MEDIA => c.media = !c.media,
+        ID_LYRICS => c.lyrics = !c.lyrics,
         ID_AGENTS => c.agents = !c.agents,
         ID_CLAUDE => c.track_claude = !c.track_claude,
         ID_CODEX => c.track_codex = !c.track_codex,
