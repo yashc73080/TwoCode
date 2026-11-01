@@ -1,5 +1,6 @@
 //! What Claude Code and Codex are doing. Transcript lines and hook events become the same small events,
 //! so a session looks the same no matter which source reported it.
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,13 +8,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const STALE_RUNNING_MS: u64 = 15 * 60 * 1000; // a closed window never says "stop", so silence ends a session
 const KEEP_FINISHED_MS: u64 = 30 * 60 * 1000;
 const FORGET_MS: u64 = 6 * 60 * 60 * 1000;
+const KEEP_RUNS_MS: u64 = 3 * 60 * 60 * 1000;
 const FRESH_MS: u64 = 15 * 1000; // older events are history being replayed at startup, not news
 const HOLD_MS: u64 = 300 * 1000;
+// Codex shows no prompt of its own until the hook answers, so it only waits a minute for you.
+const CODEX_HOLD_MS: u64 = 60 * 1000;
+const STUCK_S: u64 = 60;
+const SAME_ERROR_TIMES: u32 = 3;
+const MAX_RUNS: usize = 30;
 const QUIET_S: u64 = 30; // no news for this long: it may be stuck or waiting in its own window
 const MAX_STEPS: usize = 8;
 const MAX_FILES: usize = 40;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Agent {
     Claude,
     Codex,
@@ -40,6 +47,9 @@ pub enum Status {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
     Meta { cwd: String },
+    /// Which app runs this session: "claude-desktop", "Codex Desktop", "cli" and so on.
+    Source(String),
+    ToolError(String),
     Turn,
     Tool { label: String },
     /// What the agent last wrote or reasoned, in its own words.
@@ -108,12 +118,51 @@ fn change_plan(plan: &mut Vec<PlanItem>, change: PlanChange) {
     }
 }
 
+/// What a held request wants to do, in enough detail to decide safely.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Approval {
+    pub title: String,
+    pub what: String,
+    pub diff: Vec<DiffLine>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct DiffLine {
+    pub added: bool,
+    pub text: String,
+}
+
+/// A finished run, kept on this PC for a few hours so the agents page has something to show.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Run {
+    pub agent: Agent,
+    pub project: String,
+    pub prompt: String,
+    pub summary: String,
+    pub files: Vec<String>,
+    pub failed: bool,
+    pub at_ms: u64,
+    #[serde(default)]
+    pub source: String,
+}
+
+impl Run {
+    pub fn is_recent(&self, now: u64) -> bool {
+        now.saturating_sub(self.at_ms) < KEEP_RUNS_MS
+    }
+}
+
+/// Is any agent working or waiting? If not, the agents page shows what finished lately.
+pub fn any_live(sessions: &[SessionView]) -> bool {
+    sessions.iter().any(|s| matches!(s.status, Status::Running | Status::Waiting))
+}
+
 /// Answers a held PermissionRequest. `None` means "no opinion": the agent asks in its own window.
 pub type Responder = Box<dyn FnOnce(Option<String>) + Send>;
 
 struct Hold {
     responder: Responder,
-    what: String,
+    approval: Approval,
     input: Value,
     since: u64,
 }
@@ -139,6 +188,9 @@ struct Session {
     unseen: bool,
     /// You have looked at the result, so the list can let it go.
     viewed: bool,
+    source: String,
+    last_error: String,
+    error_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,8 +208,10 @@ pub struct SessionView {
     pub detail: String,
     pub elapsed_s: u64,
     pub can_decide: bool,
-    /// The exact command or file a held request is about.
-    pub approval: String,
+    pub approval: Approval,
+    pub source: String,
+    /// Set once the same error has come back several times.
+    pub repeated_error: Option<(String, u32)>,
     pub said: String,
     pub steps: Vec<Step>,
     pub quiet_s: u64,
@@ -230,8 +284,27 @@ impl SessionView {
         parts.join(" · ")
     }
 
+    /// Why this running session looks stuck, as specifically as the evidence allows.
+    pub fn stuck_reason(&self) -> Option<String> {
+        if self.status != Status::Running {
+            return None;
+        }
+        if let Some((_, times)) = &self.repeated_error {
+            return Some(format!("Same error {times} times"));
+        }
+        if self.quiet_s < QUIET_S {
+            return None;
+        }
+        let long = crate::layout::elapsed(self.quiet_s);
+        Some(match self.steps.last() {
+            Some(step) if !step.done && self.quiet_s >= STUCK_S && step.label.starts_with("Running") => format!("Same command for {long}"),
+            Some(step) if !step.done && self.quiet_s >= STUCK_S => format!("Same step for {long}"),
+            _ => format!("Quiet for {long}"),
+        })
+    }
+
     pub fn is_quiet(&self) -> bool {
-        self.status == Status::Running && self.quiet_s >= QUIET_S
+        self.stuck_reason().is_some()
     }
 
     /// One plain phrase for what this session needs from you.
@@ -240,8 +313,7 @@ impl SessionView {
             Status::Waiting if self.can_decide => "Needs approval".to_string(),
             Status::Waiting => "Needs you".to_string(),
             Status::Error => "Error".to_string(),
-            Status::Running if self.is_quiet() => format!("Quiet for {}", crate::layout::elapsed(self.quiet_s)),
-            Status::Running => "Working".to_string(),
+            Status::Running => self.stuck_reason().unwrap_or_else(|| "Working".to_string()),
             Status::Done => "Done".to_string(),
             Status::Idle => "Stopped".to_string(),
         }
@@ -253,6 +325,8 @@ pub struct Hub {
     sessions: HashMap<(Agent, String), Session>,
     /// Goes up when a session really finishes now, so the notch can show a short sign.
     pub finished_count: u64,
+    pub recent: Vec<Run>,
+    pub recent_changed: bool,
     pub last_finished: Option<(Agent, String, Status)>,
 }
 
@@ -277,6 +351,9 @@ impl Hub {
             test_tool: None,
             unseen: false,
             viewed: false,
+            source: String::new(),
+            last_error: String::new(),
+            error_count: 0,
         })
     }
 
@@ -293,6 +370,10 @@ impl Hub {
             if !name.is_empty() {
                 s.project = name.to_string();
             }
+            return;
+        }
+        if let Event::Source(source) = &event {
+            s.source = source.clone();
             return;
         }
         // A hook can report the end before the transcript's last lines are read. Those lines are old news.
@@ -315,6 +396,8 @@ impl Hub {
                 s.test_tool = None;
                 s.unseen = false;
                 s.viewed = false;
+                s.last_error.clear();
+                s.error_count = 0;
                 s.started = Some(ts);
                 s.ended = None;
             }
@@ -348,6 +431,14 @@ impl Hub {
                 }
             }
             Event::TestResult(passed) => s.tests = Some(passed),
+            Event::ToolError(text) => {
+                if s.last_error == text {
+                    s.error_count += 1;
+                } else {
+                    s.last_error = text;
+                    s.error_count = 1;
+                }
+            }
             Event::ToolDone => {
                 release(s, None);
                 if let Some(step) = s.steps.iter_mut().find(|step| !step.done) {
@@ -389,7 +480,7 @@ impl Hub {
                 s.status = Status::Waiting;
                 s.detail = what;
             }
-            Event::Meta { .. } | Event::End => {}
+            Event::Meta { .. } | Event::Source(_) | Event::End => {}
         }
         if let Some(status) = finished {
             let fresh = now.saturating_sub(ts) < FRESH_MS;
@@ -397,6 +488,14 @@ impl Hub {
             s.viewed = !fresh; // history replayed at startup is not news
             if fresh {
                 let project = s.project.clone();
+                if matches!(status, Status::Done | Status::Error) {
+                    let v = snapshot(s, now);
+                    let summary = if status == Status::Error { v.detail.clone() } else { v.summary() };
+                    self.recent.retain(|run| run.is_recent(now));
+                    self.recent.insert(0, Run { agent, project: v.project, prompt: v.prompt, summary, files: v.files, failed: status == Status::Error, at_ms: ts, source: v.source });
+                    self.recent.truncate(MAX_RUNS);
+                    self.recent_changed = true;
+                }
                 self.finished_count += 1;
                 self.last_finished = Some((agent, project, status));
             }
@@ -420,10 +519,10 @@ impl Hub {
     }
 
     /// Keep a PermissionRequest open until someone answers in the notch or the agent moves on.
-    pub fn hold(&mut self, agent: Agent, id: &str, label: String, what: String, input: Value, responder: Responder, now: u64) {
+    pub fn hold(&mut self, agent: Agent, id: &str, label: String, approval: Approval, input: Value, responder: Responder, now: u64) {
         let s = self.entry(agent, id, now);
         release(s, None);
-        s.hold = Some(Hold { responder, what, input, since: now });
+        s.hold = Some(Hold { responder, approval, input, since: now });
         s.status = Status::Waiting;
         s.detail = label;
         s.updated = now;
@@ -444,7 +543,10 @@ impl Hub {
     pub fn decide(&mut self, agent: Agent, id: &str, allow: bool) -> bool {
         let Some(s) = self.sessions.get_mut(&(agent, id.to_string())) else { return false };
         let Some(hold) = s.hold.take() else { return false };
-        let decision = if allow {
+        // Codex fails closed on updatedInput, so it gets a plain allow.
+        let decision = if allow && agent == Agent::Codex {
+            serde_json::json!({ "behavior": "allow" })
+        } else if allow {
             serde_json::json!({ "behavior": "allow", "updatedInput": hold.input })
         } else {
             serde_json::json!({ "behavior": "deny", "message": "Denied from TwoCode." })
@@ -460,7 +562,8 @@ impl Hub {
     pub fn expire(&mut self, now: u64) -> bool {
         let mut changed = false;
         for s in self.sessions.values_mut() {
-            if s.hold.as_ref().is_some_and(|h| now.saturating_sub(h.since) > HOLD_MS) {
+            let limit = if s.agent == Agent::Codex { CODEX_HOLD_MS } else { HOLD_MS };
+            if s.hold.as_ref().is_some_and(|h| now.saturating_sub(h.since) > limit) {
                 release(s, None);
                 s.status = Status::Running;
                 changed = true;
@@ -491,26 +594,32 @@ impl Hub {
         // What needs you comes first, then whatever was active most recently.
         list.sort_by_key(|s| (s.status != Status::Waiting, std::cmp::Reverse(s.updated)));
         list.into_iter()
-            .map(|s| SessionView {
-                agent: s.agent,
-                id: s.id.clone(),
-                project: s.project.clone(),
-                status: s.status,
-                detail: s.detail.clone(),
-                elapsed_s: s.started.map_or(0, |at| s.ended.unwrap_or(now).saturating_sub(at) / 1000),
-                can_decide: s.hold.is_some(),
-                approval: s.hold.as_ref().map_or(String::new(), |h| h.what.clone()),
-                said: s.said.clone(),
-                steps: s.steps.clone(),
-                quiet_s: if s.status == Status::Running { now.saturating_sub(s.updated) / 1000 } else { 0 },
-                prompt: s.prompt.clone(),
-                plan: s.plan.clone(),
-                files: s.files.clone(),
-                tests: s.tests,
-                unseen: s.unseen,
-                turn_over: s.ended.is_some(),
-            })
+            .map(|s| snapshot(s, now))
             .collect()
+    }
+}
+
+fn snapshot(s: &Session, now: u64) -> SessionView {
+    SessionView {
+        agent: s.agent,
+        id: s.id.clone(),
+        project: s.project.clone(),
+        status: s.status,
+        detail: s.detail.clone(),
+        elapsed_s: s.started.map_or(0, |at| s.ended.unwrap_or(now).saturating_sub(at) / 1000),
+        can_decide: s.hold.is_some(),
+        approval: s.hold.as_ref().map_or(Approval::default(), |h| h.approval.clone()),
+        source: s.source.clone(),
+        repeated_error: (s.error_count >= SAME_ERROR_TIMES).then(|| (s.last_error.clone(), s.error_count)),
+        said: s.said.clone(),
+        steps: s.steps.clone(),
+        quiet_s: if s.status == Status::Running { now.saturating_sub(s.updated) / 1000 } else { 0 },
+        prompt: s.prompt.clone(),
+        plan: s.plan.clone(),
+        files: s.files.clone(),
+        tests: s.tests,
+        unseen: s.unseen,
+        turn_over: s.ended.is_some(),
     }
 }
 
@@ -700,6 +809,9 @@ pub fn parse_claude(line: &str) -> Vec<Event> {
     if let Some(cwd) = o["cwd"].as_str() {
         out.push(Event::Meta { cwd: cwd.to_string() });
     }
+    if let Some(source) = o["entrypoint"].as_str() {
+        out.push(Event::Source(source.to_string()));
+    }
     let content = &o["message"]["content"];
     if kind == "user" {
         match content {
@@ -722,6 +834,9 @@ pub fn parse_claude(line: &str) -> Vec<Event> {
                     for p in parts.iter().filter(|p| p["type"] == "tool_result") {
                         if let Some(id) = p["tool_use_id"].as_str() {
                             out.push(Event::ToolResult { id: id.to_string(), failed: p["is_error"] == true });
+                        }
+                        if p["is_error"] == true {
+                            out.extend(p["content"].as_str().map(|text| Event::ToolError(one_line(text, 120))));
                         }
                     }
                 } else if typed || parts.iter().any(|p| p["type"] == "image") {
@@ -783,7 +898,9 @@ pub fn parse_codex(line: &str) -> Vec<Event> {
     let kind = p["type"].as_str().unwrap_or("");
     match o["type"].as_str().unwrap_or("") {
         "session_meta" | "turn_context" => {
-            p["cwd"].as_str().map(|cwd| vec![Event::Meta { cwd: cwd.to_string() }]).unwrap_or_default()
+            let mut out: Vec<Event> = p["cwd"].as_str().map(|cwd| Event::Meta { cwd: cwd.to_string() }).into_iter().collect();
+            out.extend(p["originator"].as_str().map(|source| Event::Source(source.to_string())));
+            out
         }
         "event_msg" => match kind {
             "task_started" | "turn_started" => vec![Event::Turn],
@@ -985,6 +1102,88 @@ mod tests {
     }
 
     #[test]
+    fn stuck_reasons_are_specific() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "s", NOW - 400_000, Event::Turn, NOW);
+        hub.apply(Agent::Claude, "s", NOW - 360_000, Event::Tool { label: "Running npm test".into() }, NOW);
+        assert_eq!(seen(&hub).status_text(), "Same command for 6m 00s");
+        hub.apply(Agent::Claude, "s", NOW, Event::Tool { label: "Editing a.rs".into() }, NOW);
+        assert_eq!(seen(&hub).status_text(), "Working");
+        for _ in 0..3 {
+            hub.apply(Agent::Claude, "s", NOW, Event::ToolError("exit 1".into()), NOW);
+        }
+        assert_eq!(seen(&hub).status_text(), "Same error 3 times");
+        hub.apply(Agent::Claude, "s", NOW, Event::ToolError("different".into()), NOW);
+        assert_eq!(seen(&hub).status_text(), "Working");
+    }
+
+    #[test]
+    fn claude_errors_and_sources_are_read() {
+        let line = r#"{"type":"user","entrypoint":"claude-desktop","message":{"content":[{"type":"tool_result","tool_use_id":"t","is_error":true,"content":"boom"}]}}"#;
+        let events = parse_claude(line);
+        assert!(events.contains(&Event::Source("claude-desktop".into())));
+        assert!(events.contains(&Event::ToolError("boom".into())));
+        let meta = parse_codex(r#"{"type":"session_meta","payload":{"cwd":"C:\\x","originator":"Codex Desktop"}}"#);
+        assert!(meta.contains(&Event::Source("Codex Desktop".into())));
+    }
+
+    #[test]
+    fn finished_runs_are_remembered_but_history_is_not() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "old", NOW - 60_000, Event::Done, NOW);
+        assert!(hub.recent.is_empty());
+        hub.apply(Agent::Codex, "s", NOW - 1000, Event::Turn, NOW);
+        hub.apply(Agent::Codex, "s", NOW - 1000, Event::Prompt("Fix it".into()), NOW);
+        hub.apply(Agent::Codex, "s", NOW, Event::FileChanged("a.rs".into()), NOW);
+        hub.apply(Agent::Codex, "s", NOW, Event::Done, NOW);
+        let run = &hub.recent[0];
+        assert_eq!((run.prompt.as_str(), run.summary.as_str(), run.failed), ("Fix it", "Changed 1 file · took 1s", false));
+        assert!(hub.recent_changed);
+    }
+
+    #[test]
+    fn runs_last_a_few_hours() {
+        let now = NOW + 10 * 3_600_000;
+        let run = |age: u64| Run { agent: Agent::Claude, project: String::new(), prompt: String::new(), summary: String::new(), files: vec![], failed: false, at_ms: now - age, source: String::new() };
+        assert!(run(2 * 3_600_000).is_recent(now));
+        assert!(!run(4 * 3_600_000).is_recent(now));
+        let mut hub = Hub::default();
+        hub.recent = vec![run(4 * 3_600_000)];
+        hub.apply(Agent::Codex, "s", now, Event::Turn, now);
+        hub.apply(Agent::Codex, "s", now, Event::Done, now);
+        assert_eq!(hub.recent.len(), 1);
+        assert_eq!(hub.recent[0].at_ms, now);
+    }
+
+    #[test]
+    fn only_working_or_waiting_counts_as_live() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Codex, "s", NOW, Event::Turn, NOW);
+        assert!(any_live(&hub.view(NOW)));
+        hub.apply(Agent::Codex, "s", NOW, Event::Done, NOW);
+        assert!(!any_live(&hub.view(NOW)));
+    }
+
+    #[test]
+    fn codex_gets_a_plain_allow() {
+        let mut hub = Hub::default();
+        let (log, responder) = answers();
+        hub.hold(Agent::Codex, "s", "x".into(), Approval::default(), serde_json::json!({ "command": "ls" }), responder, NOW);
+        assert!(hub.decide(Agent::Codex, "s", true));
+        let body: Value = serde_json::from_str(log.lock().unwrap()[0].as_ref().unwrap()).unwrap();
+        assert_eq!(body["hookSpecificOutput"]["decision"], serde_json::json!({ "behavior": "allow" }));
+    }
+
+    #[test]
+    fn codex_lets_go_sooner() {
+        let mut hub = Hub::default();
+        let (log, responder) = answers();
+        hub.hold(Agent::Codex, "s", "x".into(), Approval::default(), Value::Null, responder, NOW);
+        assert!(hub.expire(NOW + CODEX_HOLD_MS + 1));
+        assert_eq!(*log.lock().unwrap(), vec![None]);
+    }
+
+    #[test]
     fn prompts_lose_reply_markers() {
         assert_eq!(prompt_line("<!-- reply 5 -->\n> quoted\n\nthis is good"), "quoted this is good");
         assert_eq!(prompt_line("plain"), "plain");
@@ -1119,7 +1318,7 @@ mod tests {
     fn allow_answers_the_held_request_once() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "Running npm i".into(), String::new(), serde_json::json!({ "command": "npm i" }), responder, NOW);
+        hub.hold(Agent::Claude, "s", "Running npm i".into(), Approval::default(), serde_json::json!({ "command": "npm i" }), responder, NOW);
         assert!(seen(&hub).can_decide);
         assert_eq!(seen(&hub).status, Status::Waiting);
         assert!(hub.decide(Agent::Claude, "s", true));
@@ -1135,7 +1334,7 @@ mod tests {
     fn answering_in_the_agent_window_releases_the_hold() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, responder, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), Approval::default(), Value::Null, responder, NOW);
         hub.apply(Agent::Claude, "s", NOW + 10, Event::Tool { label: "parallel".into() }, NOW + 10);
         assert_eq!(seen(&hub).status, Status::Waiting); // a parallel tool does not answer the question
         hub.apply(Agent::Claude, "s", NOW + 20, Event::ToolDone, NOW + 20);
@@ -1147,9 +1346,9 @@ mod tests {
     fn hanging_up_ends_only_that_request() {
         let mut hub = Hub::default();
         let (_, first) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, first, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), Approval::default(), Value::Null, first, NOW);
         let (_, second) = answers();
-        hub.hold(Agent::Claude, "s", "y".into(), String::new(), Value::Null, second, NOW + 5);
+        hub.hold(Agent::Claude, "s", "y".into(), Approval::default(), Value::Null, second, NOW + 5);
         assert!(!hub.hung_up(Agent::Claude, "s", NOW)); // the old request's connection closing changes nothing
         assert!(seen(&hub).can_decide);
         assert!(hub.hung_up(Agent::Claude, "s", NOW + 5));
@@ -1160,7 +1359,7 @@ mod tests {
     fn a_forgotten_request_times_out() {
         let mut hub = Hub::default();
         let (log, responder) = answers();
-        hub.hold(Agent::Claude, "s", "x".into(), String::new(), Value::Null, responder, NOW);
+        hub.hold(Agent::Claude, "s", "x".into(), Approval::default(), Value::Null, responder, NOW);
         assert!(hub.expire(NOW + HOLD_MS + 1));
         assert_eq!(*log.lock().unwrap(), vec![None]);
     }

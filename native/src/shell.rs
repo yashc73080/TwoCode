@@ -1,9 +1,13 @@
 //! The Windows parts around the notch: tray icon, the switches menu, start with Windows, full-screen detection.
+use crate::agents::Agent;
 use crate::hooks;
 use crate::App;
-use windows::core::{w, PCWSTR};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -62,18 +66,27 @@ const ID_FULLSCREEN: usize = 8;
 const ID_STARTUP: usize = 9;
 const ID_EXIT: usize = 10;
 const ID_LYRICS: usize = 11;
+const ID_ALLOW_CODEX: usize = 12;
+const ID_SOUNDS: usize = 13;
+const ID_RECENT: usize = 14;
+const ID_DISPLAY_FIRST: usize = 100;
 
 pub fn show_menu(app: &mut App) {
     let allow_on = hooks::installed(&app.secret);
+    let allow_codex_on = hooks::codex_installed(&app.secret);
+    let displays = monitors();
     let c = app.config.clone();
-    let items: [(usize, &str, bool, bool); 9] = [
+    let items: [(usize, &str, bool, bool); 12] = [
         (ID_MEDIA, "Media player", c.media, true),
         (ID_LYRICS, "    Lyrics (from LRCLIB)", c.lyrics, c.media),
         (ID_AGENTS, "Agent tracker", c.agents, true),
         (ID_CLAUDE, "    Follow Claude Code", c.track_claude, c.agents),
         (ID_CODEX, "    Follow Codex", c.track_codex, c.agents),
         (ID_ALERTS, "    Pop up when an agent finishes", c.finish_popup, c.agents),
+        (ID_RECENT, "    Show recent runs", c.recent, c.agents),
         (ID_ALLOW, "    Allow or Deny from the notch (Claude Code)", allow_on, c.agents),
+        (ID_ALLOW_CODEX, "    Allow or Deny from the notch (Codex)", allow_codex_on, c.agents),
+        (ID_SOUNDS, "Sounds", c.sounds, true),
         (ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true),
         (ID_STARTUP, "Start with Windows", starts_with_windows(), true),
     ];
@@ -89,7 +102,19 @@ pub fn show_menu(app: &mut App) {
                 flags |= MF_GRAYED;
             }
             let _ = AppendMenuW(menu, flags, *id, PCWSTR(wide.as_ptr()));
-            if i == 6 || i == 8 {
+            if i == 9 {
+                if let Ok(sub) = CreatePopupMenu() {
+                    let chosen = displays.iter().position(|d| d.name == c.display).or_else(|| displays.iter().position(|d| d.primary));
+                    for (n, d) in displays.iter().enumerate() {
+                        let name = format!("Display {} ({} x {}){}", n + 1, d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, if d.primary { ", main" } else { "" });
+                        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                        let flags = if chosen == Some(n) { MF_STRING | MF_CHECKED } else { MF_STRING };
+                        let _ = AppendMenuW(sub, flags, ID_DISPLAY_FIRST + n, PCWSTR(wide.as_ptr()));
+                    }
+                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Show on"));
+                }
+            }
+            if i == 8 || i == 11 {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
         }
@@ -100,11 +125,20 @@ pub fn show_menu(app: &mut App) {
         let _ = SetForegroundWindow(hwnd); // otherwise the menu does not close when you click elsewhere
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, at.x, at.y, None, hwnd, None);
         let _ = DestroyMenu(menu);
-        choose(app, chosen.0 as usize, allow_on);
+        let chosen = chosen.0 as usize;
+        if chosen >= ID_DISPLAY_FIRST {
+            if let Some(d) = displays.get(chosen - ID_DISPLAY_FIRST) {
+                app.config.display = d.name.clone();
+                app.config.save();
+                app.recreate_graphics();
+            }
+            return;
+        }
+        choose(app, chosen, allow_on, allow_codex_on);
     }
 }
 
-fn choose(app: &mut App, id: usize, allow_on: bool) {
+fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {
     let c = &mut app.config;
     match id {
         ID_MEDIA => c.media = !c.media,
@@ -114,6 +148,14 @@ fn choose(app: &mut App, id: usize, allow_on: bool) {
         ID_CODEX => c.track_codex = !c.track_codex,
         ID_ALERTS => c.finish_popup = !c.finish_popup,
         ID_FULLSCREEN => c.hide_fullscreen = !c.hide_fullscreen,
+        ID_SOUNDS => c.sounds = !c.sounds,
+        ID_RECENT => c.recent = !c.recent,
+        ID_ALLOW_CODEX => {
+            if let Err(why) = hooks::set_codex_installed(!allow_codex_on, &app.secret) {
+                show_error(&why);
+            }
+            return;
+        }
         ID_ALLOW => {
             if let Err(why) = hooks::set_installed(!allow_on, &app.secret) {
                 show_error(&why);
@@ -183,7 +225,169 @@ pub fn foreground_is_fullscreen(own: HWND) -> bool {
             return false;
         }
         let m = info.rcMonitor;
-        // the notch lives on the main screen, so a full-screen window elsewhere does not hide it
-        m.left == 0 && m.top == 0 && rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+        // only a full-screen window on the notch's own display hides it
+        monitor == MonitorFromWindow(own, MONITOR_DEFAULTTONEAREST) && rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+    }
+}
+
+// ---- displays ----
+
+pub struct Display {
+    pub name: String,
+    pub rect: RECT,
+    pub primary: bool,
+}
+
+unsafe extern "system" fn add_monitor(monitor: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
+    let list = &mut *(list.0 as *mut Vec<Display>);
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    if GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+        let end = info.szDevice.iter().position(|c| *c == 0).unwrap_or(info.szDevice.len());
+        list.push(Display {
+            name: String::from_utf16_lossy(&info.szDevice[..end]),
+            rect: info.monitorInfo.rcMonitor,
+            primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+        });
+    }
+    TRUE
+}
+
+pub fn monitors() -> Vec<Display> {
+    let mut list: Vec<Display> = vec![];
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(add_monitor), LPARAM(&mut list as *mut _ as isize));
+    }
+    list
+}
+
+/// The chosen display's area, or the main display's if that one is gone.
+pub fn display_rect(chosen: &str) -> RECT {
+    let list = monitors();
+    let pick = list.iter().find(|d| d.name == chosen).or_else(|| list.iter().find(|d| d.primary)).or(list.first());
+    pick.map_or(RECT { left: 0, top: 0, right: unsafe { GetSystemMetrics(SM_CXSCREEN) }, bottom: 0 }, |d| d.rect)
+}
+
+// ---- sounds ----
+
+#[derive(Clone, Copy)]
+pub enum Chime {
+    Finished,
+    Failed,
+    NeedsYou,
+}
+
+/// One of Windows' own soft sounds. Never waits, and fails silently if the file is missing.
+pub fn chime(kind: Chime) {
+    let file = match kind {
+        Chime::Finished => "Windows Notify System Generic.wav",
+        Chime::Failed => "Windows Background.wav",
+        Chime::NeedsYou => "Windows Notify Calendar.wav",
+    };
+    let root = std::env::var_os("windir").unwrap_or_else(|| "C:\\Windows".into());
+    let path: Vec<u16> = format!("{}\\Media\\{file}", root.to_string_lossy()).encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let _ = PlaySoundW(PCWSTR(path.as_ptr()), None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+// ---- jump to a session ----
+
+pub struct WinInfo {
+    pub hwnd: HWND,
+    pub exe: String,
+    pub title: String,
+}
+
+/// Which window most likely runs this session. Desktop apps have one window per app;
+/// terminals and editors usually name the project in their title.
+pub fn pick_window(list: &[WinInfo], agent: Agent, source: &str, project: &str) -> Option<usize> {
+    let by_exe = |exe: &str| list.iter().position(|w| w.exe == exe);
+    if agent == Agent::Claude && source == "claude-desktop" {
+        return by_exe("claude.exe");
+    }
+    if agent == Agent::Codex && source == "Codex Desktop" {
+        if let Some(found) = by_exe("codex.exe") {
+            return Some(found);
+        }
+    }
+    const EDITORS: [&str; 3] = ["code.exe", "cursor.exe", "windsurf.exe"];
+    const TERMINALS: [&str; 7] = ["windowsterminal.exe", "wezterm-gui.exe", "alacritty.exe", "pwsh.exe", "powershell.exe", "cmd.exe", "conhost.exe"];
+    let hosts = |w: &WinInfo| EDITORS.contains(&w.exe.as_str()) || TERMINALS.contains(&w.exe.as_str());
+    let needle = project.to_lowercase();
+    if !needle.is_empty() {
+        if let Some(found) = list.iter().position(|w| hosts(w) && w.title.to_lowercase().contains(&needle)) {
+            return Some(found);
+        }
+    }
+    if source.contains("vscode") {
+        if let Some(found) = list.iter().position(|w| EDITORS.contains(&w.exe.as_str())) {
+            return Some(found);
+        }
+    }
+    list.iter().position(|w| TERMINALS.contains(&w.exe.as_str()))
+}
+
+unsafe extern "system" fn add_window(hwnd: HWND, list: LPARAM) -> BOOL {
+    let list = &mut *(list.0 as *mut Vec<WinInfo>);
+    let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|o| !o.is_invalid());
+    let mut title = [0u16; 256];
+    let n = GetWindowTextW(hwnd, &mut title).max(0) as usize;
+    if IsWindowVisible(hwnd).as_bool() && !owned && n > 0 {
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut path = [0u16; 512];
+            let mut size = path.len() as u32;
+            let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(path.as_mut_ptr()), &mut size).is_ok();
+            let _ = CloseHandle(process);
+            if ok {
+                let full = String::from_utf16_lossy(&path[..size as usize]);
+                let exe = full.rsplit('\\').next().unwrap_or("").to_lowercase();
+                list.push(WinInfo { hwnd, exe, title: String::from_utf16_lossy(&title[..n]) });
+            }
+        }
+    }
+    TRUE
+}
+
+/// Brings the session's window to the front. False if no window was found or Windows refused.
+pub fn jump_to(agent: Agent, source: &str, project: &str) -> bool {
+    let mut list: Vec<WinInfo> = vec![];
+    unsafe {
+        let _ = EnumWindows(Some(add_window), LPARAM(&mut list as *mut _ as isize));
+        let Some(at) = pick_window(&list, agent, source, project) else { return false };
+        let hwnd = list[at].hwnd;
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return true;
+        }
+        // Windows limits who may change the front window; a tap of Alt counts as the user's request.
+        keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        let _ = SetForegroundWindow(hwnd);
+        GetForegroundWindow() == hwnd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(exe: &str, title: &str) -> WinInfo {
+        WinInfo { hwnd: HWND::default(), exe: exe.into(), title: title.into() }
+    }
+
+    #[test]
+    fn finds_the_right_window() {
+        let list = [win("msedge.exe", "webshop - Edge"), win("code.exe", "other - VS Code"), win("windowsterminal.exe", "webshop: claude"), win("claude.exe", "Claude")];
+        assert_eq!(pick_window(&list, Agent::Claude, "claude-desktop", "webshop"), Some(3));
+        assert_eq!(pick_window(&list, Agent::Claude, "cli", "webshop"), Some(2)); // not Edge, despite its title
+        assert_eq!(pick_window(&list, Agent::Codex, "codex_exec", "nothing"), Some(2)); // any terminal
+        let editor = [win("code.exe", "a.rs - shop - VS Code")];
+        assert_eq!(pick_window(&editor, Agent::Claude, "claude-vscode", "elsewhere"), Some(0));
+        assert_eq!(pick_window(&[win("msedge.exe", "x")], Agent::Claude, "cli", "x"), None);
     }
 }

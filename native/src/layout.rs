@@ -7,8 +7,7 @@ pub const CANVAS_H: f32 = 170.0;
 const DURATION_MS: f32 = 240.0;
 const MEDIA_W: f32 = 320.0;
 const MEDIA_LYRICS_W: f32 = 540.0;
-const AGENTS_W: f32 = 420.0;
-const SESSION_W: f32 = 480.0;
+const AGENTS_W: f32 = 440.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -31,6 +30,8 @@ pub struct Shape {
 pub enum Tab {
     #[default]
     Media,
+    // Settings saved before Recent joined the agents page still load.
+    #[serde(alias = "Recent")]
     Agents,
 }
 
@@ -67,11 +68,12 @@ pub fn open_shape(w: f32) -> Shape {
 }
 
 /// How wide the open notch needs to be for what it is showing.
-pub fn open_width(tab: Tab, lyrics_showing: bool, session_open: bool) -> f32 {
+pub fn open_width(tab: Tab, lyrics_showing: bool, no_agents: bool) -> f32 {
     match tab {
         Tab::Media if lyrics_showing => MEDIA_LYRICS_W,
         Tab::Media => MEDIA_W,
-        Tab::Agents if session_open => SESSION_W,
+        // With nothing to list it stays the media page's size, so switching tabs moves nothing.
+        Tab::Agents if no_agents => MEDIA_W,
         Tab::Agents => AGENTS_W,
     }
 }
@@ -133,6 +135,17 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
+/// "just now", "12m ago", "3h ago", "2d ago".
+pub fn ago(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => "just now".to_string(),
+        1..=59 => format!("{minutes}m ago"),
+        60..=1439 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
 pub fn elapsed(s: u64) -> String {
     if s < 60 {
         format!("{s}s")
@@ -177,7 +190,8 @@ mod tests {
     fn lyrics_off_is_much_narrower() {
         assert!(open_width(Tab::Media, false, false) * 1.5 < open_width(Tab::Media, true, false));
         assert!(open_width(Tab::Media, true, false) * 1.03 < CANVAS_W);
-        assert!(open_width(Tab::Agents, false, true) * 1.03 < CANVAS_W);
+        assert!(open_width(Tab::Agents, false, false) * 1.03 < CANVAS_W);
+        assert_eq!(open_width(Tab::Agents, false, true), open_width(Tab::Media, false, false));
     }
 
     #[test]
@@ -211,5 +225,8 @@ mod tests {
         assert_eq!(clock(3_725_000), "1:02:05");
         assert_eq!(elapsed(9), "9s");
         assert_eq!(elapsed(65), "1m 05s");
+        assert_eq!(ago(30_000), "just now");
+        assert_eq!(ago(720_000), "12m ago");
+        assert_eq!(ago(3 * 3_600_000), "3h ago");
     }
 }

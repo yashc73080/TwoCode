@@ -1,5 +1,5 @@
 //! What the notch shows in each state, and which parts of it you can click.
-use crate::agents::{Agent, Pill, PlanState, SessionView, Status};
+use crate::agents::{self, Agent, Pill, PlanState, Run, SessionView, Status};
 use crate::gfx::{Align, Gfx, Rect};
 use crate::layout::{self, Mode, Shape, Tab, CANVAS_W};
 use crate::lyrics::{self, Line};
@@ -16,6 +16,7 @@ const CLAUDE: u32 = 0xE08A5F;
 const CODEX: u32 = 0x7DD3C0;
 const PAD: f32 = 16.0;
 const MUSIC_W: f32 = 250.0;
+pub const RUN_ROWS: usize = 3;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Action {
@@ -30,6 +31,9 @@ pub enum Action {
     Tab(Tab),
     Open(Agent, String),
     Back,
+    Jump(Agent, String),
+    OpenRun(u64),
+    JumpRun(u64),
 }
 
 pub struct Scene<'a> {
@@ -44,6 +48,11 @@ pub struct Scene<'a> {
     pub sessions: &'a [SessionView],
     pub selected: Option<&'a SessionView>,
     pub pill: Pill,
+    pub runs: &'a [&'a Run],
+    pub selected_run: Option<&'a Run>,
+    pub runs_scroll: usize,
+    pub following: (bool, bool),
+    pub now_ms: u64,
     pub peek: Option<&'a str>,
     pub peek_status: Status,
     pub hovered: Option<&'a Action>,
@@ -177,7 +186,7 @@ fn is_hovered(s: &Scene, action: &Action) -> bool {
 fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
     let m = s.media;
     if !m.present {
-        g.text("Nothing playing", Rect { h: a.h - 14.0, ..a }, 13.0, false, Align::Center, FAINT, alpha);
+        draw_empty_player(g, a, alpha);
         return;
     }
     let split = s.lyrics_on && !s.lyric_lines.is_empty();
@@ -225,31 +234,14 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
         g.fill(bubble, 14.0, WHITE, 0.12 * alpha);
     }
     let shade = if s.lyrics_on { 1.0 } else { 0.45 };
-    let (bx, by) = (bubble.x + 14.0, cy);
-    g.fill(Rect { x: bx - 8.0, y: by - 6.5, w: 16.0, h: 11.0 }, 3.5, WHITE, shade * alpha);
-    g.polygon(&[(bx - 4.0, by + 3.5), (bx + 1.0, by + 3.5), (bx - 4.0, by + 8.0)], WHITE, shade * alpha);
+    draw_bubble(g, bubble.x + 14.0, cy, shade * alpha);
     hits.push((bubble, Action::ToggleLyrics));
     for (offset, action) in [(-40.0, Action::Previous), (0.0, Action::Toggle), (40.0, Action::Next)] {
         let box_r = Rect { x: cx + offset - 14.0, y: cy - 14.0, w: 28.0, h: 28.0 };
         if is_hovered(s, &action) {
             g.fill(box_r, 14.0, WHITE, 0.12 * alpha);
         }
-        let px = cx + offset;
-        match action {
-            Action::Previous => {
-                g.polygon(&[(px, cy - 6.0), (px, cy + 6.0), (px - 8.0, cy)], WHITE, alpha);
-                g.polygon(&[(px + 8.0, cy - 6.0), (px + 8.0, cy + 6.0), (px, cy)], WHITE, alpha);
-            }
-            Action::Next => {
-                g.polygon(&[(px, cy - 6.0), (px, cy + 6.0), (px + 8.0, cy)], WHITE, alpha);
-                g.polygon(&[(px - 8.0, cy - 6.0), (px - 8.0, cy + 6.0), (px, cy)], WHITE, alpha);
-            }
-            _ if m.playing => {
-                g.fill(Rect { x: px - 5.0, y: cy - 7.0, w: 3.5, h: 14.0 }, 1.0, WHITE, alpha);
-                g.fill(Rect { x: px + 1.5, y: cy - 7.0, w: 3.5, h: 14.0 }, 1.0, WHITE, alpha);
-            }
-            _ => g.polygon(&[(px - 5.0, cy - 8.0), (px - 5.0, cy + 8.0), (px + 8.0, cy)], WHITE, alpha),
-        }
+        draw_transport(g, cx + offset, cy, &action, m.playing, alpha);
         hits.push((box_r, action));
     }
 
@@ -257,6 +249,55 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
         let lx = x + w + 16.0;
         g.fill(Rect { x: lx - 8.0, y: 14.0, w: 1.0, h: 100.0 }, 0.0, WHITE, 0.1 * alpha);
         draw_lyrics(g, s, Rect { x: lx, y: 8.0, w: a.x + a.w - lx - PAD, h: 112.0 }, now, alpha, hits);
+    }
+}
+
+fn draw_bubble(g: &mut Gfx, x: f32, y: f32, alpha: f32) {
+    g.fill(Rect { x: x - 8.0, y: y - 6.5, w: 16.0, h: 11.0 }, 3.5, WHITE, alpha);
+    g.polygon(&[(x - 4.0, y + 3.5), (x + 1.0, y + 3.5), (x - 4.0, y + 8.0)], WHITE, alpha);
+}
+
+fn draw_transport(g: &mut Gfx, px: f32, cy: f32, action: &Action, playing: bool, alpha: f32) {
+    match action {
+        Action::Previous => {
+            g.polygon(&[(px, cy - 6.0), (px, cy + 6.0), (px - 8.0, cy)], WHITE, alpha);
+            g.polygon(&[(px + 8.0, cy - 6.0), (px + 8.0, cy + 6.0), (px, cy)], WHITE, alpha);
+        }
+        Action::Next => {
+            g.polygon(&[(px, cy - 6.0), (px, cy + 6.0), (px + 8.0, cy)], WHITE, alpha);
+            g.polygon(&[(px - 8.0, cy - 6.0), (px - 8.0, cy + 6.0), (px, cy)], WHITE, alpha);
+        }
+        _ if playing => {
+            g.fill(Rect { x: px - 5.0, y: cy - 7.0, w: 3.5, h: 14.0 }, 1.0, WHITE, alpha);
+            g.fill(Rect { x: px + 1.5, y: cy - 7.0, w: 3.5, h: 14.0 }, 1.0, WHITE, alpha);
+        }
+        _ => g.polygon(&[(px - 5.0, cy - 8.0), (px - 5.0, cy + 8.0), (px + 8.0, cy)], WHITE, alpha),
+    }
+}
+
+/// The player at rest: the same layout as a playing song, with nothing to press.
+fn draw_empty_player(g: &mut Gfx, a: Rect, alpha: f32) {
+    let x = a.x + PAD + 4.0;
+    let w = a.w - (PAD + 4.0) * 2.0;
+    let art = Rect { x, y: 10.0, w: 54.0, h: 54.0 };
+    g.fill(art, 10.0, WHITE, 0.08 * alpha);
+    draw_tab_icon(g, Tab::Media, art.x + 26.0, art.y + 28.0, 0.45 * alpha);
+    let tx = art.x + art.w + 12.0;
+    let tw = x + w - tx;
+    g.text("Nothing playing", Rect { x: tx, y: 16.0, w: tw, h: 22.0 }, 14.5, true, Align::Left, WHITE, alpha);
+    g.text("Play something in any app", Rect { x: tx, y: 38.0, w: tw, h: 18.0 }, 12.0, false, Align::Left, MUTED, alpha);
+
+    let cy = 78.0;
+    let label = 40.0;
+    g.fill(Rect { x: x + label, y: cy - 1.5, w: w - label * 2.0, h: 3.0 }, 2.0, WHITE, 0.14 * alpha);
+    g.text("0:00", Rect { x, y: cy - 9.0, w: label - 6.0, h: 18.0 }, 11.0, false, Align::Left, FAINT, alpha);
+    g.text("--:--", Rect { x: x + w - label, y: cy - 9.0, w: label, h: 18.0 }, 11.0, false, Align::Right, FAINT, alpha);
+
+    let cy = 104.0;
+    let cx = x + w / 2.0;
+    draw_bubble(g, x + 12.0, cy, 0.2 * alpha);
+    for (offset, action) in [(-40.0, Action::Previous), (0.0, Action::Toggle), (40.0, Action::Next)] {
+        draw_transport(g, cx + offset, cy, &action, false, 0.28 * alpha);
     }
 }
 
@@ -297,10 +338,40 @@ fn state_colour(v: &SessionView) -> u32 {
 fn draw_agents(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
     if let Some(v) = s.selected {
         draw_session(g, s, v, a, alpha, hits);
-    } else if s.sessions.is_empty() {
-        g.text("No active agents", Rect { h: a.h - 16.0, ..a }, 13.0, false, Align::Center, FAINT, alpha);
-    } else {
+    } else if let Some(run) = s.selected_run {
+        draw_run(g, s, run, a, alpha, hits);
+    } else if agents::any_live(s.sessions) {
         draw_list(g, s, a, alpha, hits);
+    } else if !s.runs.is_empty() {
+        draw_runs(g, s, a, alpha, hits);
+    } else if !s.sessions.is_empty() {
+        draw_list(g, s, a, alpha, hits);
+    } else {
+        draw_no_agents(g, s, a, alpha);
+    }
+}
+
+/// The page at rest: which agents it is listening for, in the same layout as the player.
+fn draw_no_agents(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32) {
+    let x = a.x + PAD + 4.0;
+    let w = a.w - (PAD + 4.0) * 2.0;
+    let tile = Rect { x, y: 10.0, w: 54.0, h: 54.0 };
+    g.fill(tile, 10.0, WHITE, 0.08 * alpha);
+    draw_tab_icon(g, Tab::Agents, tile.x + 27.0, tile.y + 29.0, 0.45 * alpha);
+    let tx = tile.x + tile.w + 12.0;
+    let tw = x + w - tx;
+    let hint = if s.following == (false, false) { "Follow one from the right-click menu" } else { "Runs appear here when they start" };
+    g.text("No agents running", Rect { x: tx, y: 16.0, w: tw, h: 22.0 }, 14.5, true, Align::Left, WHITE, alpha);
+    g.text(hint, Rect { x: tx, y: 38.0, w: tw, h: 18.0 }, 12.0, false, Align::Left, MUTED, alpha);
+
+    let half = (w - 8.0) / 2.0;
+    for (i, (agent, on)) in [(Agent::Claude, s.following.0), (Agent::Codex, s.following.1)].into_iter().enumerate() {
+        let r = Rect { x: x + i as f32 * (half + 8.0), y: 76.0, w: half, h: 28.0 };
+        let (name, tint) = brand(agent);
+        g.fill(r, 14.0, WHITE, 0.06 * alpha);
+        g.circle(r.x + 14.0, r.y + 14.0, 3.5, if on { tint } else { FAINT }, alpha);
+        g.text(name, Rect { x: r.x + 24.0, y: r.y, w: 48.0, h: r.h }, 11.5, true, Align::Left, if on { WHITE } else { FAINT }, alpha);
+        g.text(if on { "Following" } else { "Off" }, Rect { x: r.x + r.w - 72.0, y: r.y, w: 60.0, h: r.h }, 10.5, false, Align::Right, FAINT, alpha);
     }
 }
 
@@ -389,16 +460,30 @@ fn draw_session(g: &mut Gfx, s: &Scene, v: &SessionView, a: Rect, alpha: f32, hi
     let (name, tint) = brand(v.agent);
     g.text(name, Rect { x: x + 24.0, y: 8.0, w: 44.0, h: 20.0 }, 11.5, true, Align::Left, tint, alpha);
     let status = if v.elapsed_s > 0 { format!("{} · {}", v.status_text(), layout::elapsed(v.elapsed_s)) } else { v.status_text() };
-    let status_w = 170.0;
-    g.text(&v.project, Rect { x: x + 68.0, y: 8.0, w: w - 68.0 - status_w, h: 20.0 }, 12.5, true, Align::Left, WHITE, alpha);
-    g.text(&status, Rect { x: x + w - status_w, y: 8.0, w: status_w, h: 20.0 }, 11.0, true, Align::Right, state_colour(v), alpha);
+    let (status_w, open_w) = (150.0, 46.0);
+    let jump = Action::Jump(v.agent, v.id.clone());
+    let open_r = Rect { x: x + w - open_w, y: 8.0, w: open_w, h: 20.0 };
+    g.fill(open_r, 10.0, WHITE, if is_hovered(s, &jump) { 0.24 } else { 0.12 } * alpha);
+    g.text("Open", open_r, 10.5, true, Align::Center, WHITE, alpha);
+    hits.push((open_r, jump));
+    let status_x = x + w - open_w - 8.0 - status_w;
+    g.text(&v.project, Rect { x: x + 68.0, y: 8.0, w: status_x - x - 68.0, h: 20.0 }, 12.5, true, Align::Left, WHITE, alpha);
+    g.text(&status, Rect { x: status_x, y: 8.0, w: status_w, h: 20.0 }, 11.0, true, Align::Right, state_colour(v), alpha);
 
     if v.can_decide {
-        g.text("Wants to run", Rect { x, y: 32.0, w, h: 15.0 }, 10.5, false, Align::Left, FAINT, alpha);
+        g.text(&v.approval.title, Rect { x, y: 32.0, w, h: 15.0 }, 10.5, false, Align::Left, FAINT, alpha);
         let box_r = Rect { x, y: 48.0, w, h: 38.0 };
         g.fill(box_r, 8.0, WHITE, 0.08 * alpha);
         let body = Rect { x: x + 8.0, y: 50.0, w: w - 16.0, h: 34.0 };
-        g.text_wrapped(&v.approval, body, 11.5, false, Align::Left, WHITE, alpha);
+        if v.approval.diff.is_empty() {
+            g.text_wrapped(&v.approval.what, body, 11.5, false, Align::Left, WHITE, alpha);
+        } else {
+            for (i, line) in v.approval.diff.iter().take(2).enumerate() {
+                let (mark, hex) = if line.added { ("+", GREEN) } else { ("-", RED) };
+                let row = Rect { y: body.y + i as f32 * 17.0, h: 17.0, ..body };
+                g.text(&format!("{mark} {}", line.text), row, 11.0, false, Align::Left, hex, alpha);
+            }
+        }
         let (deny, allow) = (Action::Deny(v.agent, v.id.clone()), Action::Allow(v.agent, v.id.clone()));
         let half = (w - 8.0) / 2.0;
         let deny_r = Rect { x, y: 91.0, w: half, h: 25.0 };
@@ -434,15 +519,16 @@ fn draw_session(g: &mut Gfx, s: &Scene, v: &SessionView, a: Rect, alpha: f32, hi
     }
     if !v.plan.is_empty() {
         draw_checklist(g, v, Rect { x, y: 47.0, w, h: 50.0 }, alpha);
-        let live = if v.is_quiet() { "No news. It may be on a long command or waiting in its own window." } else { v.detail.as_str() };
+        let hint = stuck_hint(v);
+        let live = hint.as_deref().unwrap_or(v.detail.as_str());
         g.text(live, Rect { x, y: 98.0, w, h: 18.0 }, 10.5, false, Align::Left, if v.is_quiet() { AMBER } else { FAINT }, alpha);
         return;
     }
     let said = if v.said.is_empty() { &v.detail } else { &v.said };
     g.text_wrapped(said, Rect { x, y: 46.0, w, h: 34.0 }, 11.5, false, Align::Left, WHITE, alpha);
     let mut y = 81.0;
-    if v.is_quiet() {
-        g.text("No news. It may be on a long command or waiting in its own window.", Rect { x, y, w, h: 16.0 }, 10.5, false, Align::Left, AMBER, alpha);
+    if let Some(hint) = stuck_hint(v) {
+        g.text(&hint, Rect { x, y, w, h: 16.0 }, 10.5, false, Align::Left, AMBER, alpha);
         y += 16.0;
     }
     let rows = ((116.0 - y) / 16.0) as usize;
@@ -452,6 +538,69 @@ fn draw_session(g: &mut Gfx, s: &Scene, v: &SessionView, a: Rect, alpha: f32, hi
         g.text(&step.label, Rect { x: x + 12.0, y, w: w - 12.0, h: 16.0 }, 11.0, !step.done, Align::Left, text_hex, opacity * alpha);
         y += 16.0;
     }
+}
+
+fn stuck_hint(v: &SessionView) -> Option<String> {
+    if !v.is_quiet() {
+        return None;
+    }
+    Some(match &v.repeated_error {
+        Some((error, _)) => error.clone(),
+        None => "It may be on a long command or waiting in its own window.".to_string(),
+    })
+}
+
+/// What finished in the last few hours, for when no agent is working.
+fn draw_runs(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let shown = s.runs.len().min(RUN_ROWS);
+    let scroll = s.runs_scroll.min(s.runs.len() - shown);
+    let row_h = 37.0;
+    let (x, w, top) = (a.x + 10.0, a.w - 20.0, 7.0 + (RUN_ROWS - shown) as f32 * row_h / 2.0);
+    for (i, run) in s.runs.iter().enumerate().skip(scroll).take(RUN_ROWS) {
+        let r = Rect { x, y: top + (i - scroll) as f32 * row_h, w, h: row_h - 2.0 };
+        let action = Action::OpenRun(run.at_ms);
+        if is_hovered(s, &action) {
+            g.fill(r, 10.0, WHITE, 0.08 * alpha);
+        }
+        let (name, tint) = brand(run.agent);
+        g.circle(r.x + 11.0, r.y + 11.0, 4.0, if run.failed { RED } else { GREEN }, alpha);
+        g.text(name, Rect { x: r.x + 22.0, y: r.y + 1.0, w: 44.0, h: 19.0 }, 11.5, true, Align::Left, tint, alpha);
+        g.text(&run.project, Rect { x: r.x + 66.0, y: r.y + 1.0, w: r.w - 66.0 - 78.0, h: 19.0 }, 12.0, true, Align::Left, WHITE, alpha);
+        let when = layout::ago(s.now_ms.saturating_sub(run.at_ms));
+        g.text(&when, Rect { x: r.x + r.w - 74.0, y: r.y + 1.0, w: 66.0, h: 19.0 }, 10.5, false, Align::Right, FAINT, alpha);
+        g.text(&run.summary, Rect { x: r.x + 22.0, y: r.y + 17.0, w: r.w - 30.0, h: 17.0 }, 11.0, false, Align::Left, MUTED, alpha);
+        hits.push((r, action));
+    }
+    if s.runs.len() > RUN_ROWS {
+        let track = row_h * RUN_ROWS as f32 - 6.0;
+        let thumb = track * RUN_ROWS as f32 / s.runs.len() as f32;
+        let y = top + 2.0 + track * scroll as f32 / s.runs.len() as f32;
+        g.fill(Rect { x: a.x + a.w - 6.0, y, w: 2.5, h: thumb }, 1.2, WHITE, 0.35 * alpha);
+    }
+}
+
+fn draw_run(g: &mut Gfx, s: &Scene, run: &Run, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let (x, w) = (a.x + 16.0, a.w - 32.0);
+    let back = Rect { x: x - 6.0, y: 6.0, w: 26.0, h: 24.0 };
+    if is_hovered(s, &Action::Back) {
+        g.fill(back, 12.0, WHITE, 0.12 * alpha);
+    }
+    g.text("‹", back, 19.0, false, Align::Center, WHITE, alpha);
+    hits.push((back, Action::Back));
+    let (name, tint) = brand(run.agent);
+    g.text(name, Rect { x: x + 24.0, y: 8.0, w: 44.0, h: 20.0 }, 11.5, true, Align::Left, tint, alpha);
+    let (when_w, open_w) = (70.0, 46.0);
+    let jump = Action::JumpRun(run.at_ms);
+    let open_r = Rect { x: x + w - open_w, y: 8.0, w: open_w, h: 20.0 };
+    g.fill(open_r, 10.0, WHITE, if is_hovered(s, &jump) { 0.24 } else { 0.12 } * alpha);
+    g.text("Open", open_r, 10.5, true, Align::Center, WHITE, alpha);
+    hits.push((open_r, jump));
+    let when_x = x + w - open_w - 8.0 - when_w;
+    g.text(&run.project, Rect { x: x + 68.0, y: 8.0, w: when_x - x - 68.0, h: 20.0 }, 12.5, true, Align::Left, WHITE, alpha);
+    g.text(&layout::ago(s.now_ms.saturating_sub(run.at_ms)), Rect { x: when_x, y: 8.0, w: when_w, h: 20.0 }, 10.5, false, Align::Right, FAINT, alpha);
+    g.text(&run.prompt, Rect { x, y: 29.0, w, h: 16.0 }, 11.0, false, Align::Left, MUTED, alpha);
+    g.text(&run.summary, Rect { x, y: 47.0, w, h: 18.0 }, 12.5, true, Align::Left, if run.failed { RED } else { WHITE }, alpha);
+    g.text_wrapped(&run.files.join(", "), Rect { x, y: 66.0, w, h: 50.0 }, 11.0, false, Align::Left, MUTED, alpha);
 }
 
 /// Three lines of the task list, kept around the step in progress.

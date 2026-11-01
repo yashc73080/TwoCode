@@ -11,7 +11,7 @@ mod shell;
 mod view;
 mod watcher;
 
-use agents::{Agent, Hub, SessionView, Status};
+use agents::{Agent, Hub, Run, SessionView, Status};
 use config::Config;
 use gfx::{Gfx, Rect};
 use layout::{Mode, Motion, Shape, Tab, CANVAS_H, CANVAS_W};
@@ -91,6 +91,9 @@ pub struct App {
     selected: Option<(Agent, String)>,
     auto_selected: bool,
     viewed_agents: bool,
+    runs: Vec<Run>,
+    selected_run: Option<u64>,
+    runs_scroll: usize,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -122,6 +125,12 @@ impl App {
         }
     }
 
+    fn play(&self, chime: shell::Chime) {
+        if self.config.sounds {
+            shell::chime(chime);
+        }
+    }
+
     fn selected_view(&self) -> Option<&SessionView> {
         let (agent, id) = self.selected.as_ref()?;
         self.sessions.iter().find(|s| s.agent == *agent && s.id == *id)
@@ -129,7 +138,8 @@ impl App {
 
     fn open_width(&self) -> f32 {
         let lyrics = self.config.lyrics && !self.lyric_lines.is_empty() && self.media.present;
-        layout::open_width(self.config.tab, lyrics, self.selected_view().is_some())
+        let no_agents = self.sessions.is_empty() && visible_runs(&self.runs, &self.config, agents::now_ms()).is_empty();
+        layout::open_width(self.config.tab, lyrics, no_agents)
     }
 
     fn tabs(&self) -> Vec<Tab> {
@@ -141,6 +151,7 @@ impl App {
         let deciding = self.needs_decision();
         if deciding && !self.was_deciding {
             self.config.tab = Tab::Agents;
+            self.play(shell::Chime::NeedsYou);
         }
         // A question opens on that session, and moves on when it is answered.
         let waiting = self.sessions.iter().find(|s| s.can_decide).map(|s| (s.agent, s.id.clone()));
@@ -180,10 +191,17 @@ impl App {
         let now = agents::now_ms();
         let mut finished = None;
         let all = match self.hub.lock() {
-            Ok(hub) => {
+            Ok(mut hub) => {
                 if hub.finished_count != self.finished_seen {
                     self.finished_seen = hub.finished_count;
                     finished = hub.last_finished.clone();
+                }
+                if hub.recent_changed {
+                    hub.recent_changed = false;
+                    self.runs = hub.recent.clone();
+                    if self.config.recent {
+                        config::save_runs(&self.runs);
+                    }
                 }
                 hub.view(now)
             }
@@ -205,6 +223,13 @@ impl App {
                 Agent::Claude => self.config.track_claude,
                 Agent::Codex => self.config.track_codex,
             };
+            if self.config.agents && tracked {
+                self.play(match status {
+                    Status::Error => shell::Chime::Failed,
+                    Status::Waiting => shell::Chime::NeedsYou,
+                    _ => shell::Chime::Finished,
+                });
+            }
             if self.config.finish_popup && self.config.agents && tracked {
                 let verb = match status {
                     Status::Error => "hit an error",
@@ -230,6 +255,8 @@ impl App {
         self.note_viewing(next);
         if next == Mode::Rest {
             self.selected = None;
+            self.selected_run = None;
+            self.runs_scroll = 0;
         }
         let to = if next == Mode::Open { layout::open_shape(self.open_width()) } else { layout::shape_for(next) };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
@@ -265,6 +292,44 @@ impl App {
             album: self.media.album.clone(),
             duration_ms: self.media.duration_ms,
         });
+    }
+
+    fn jump(&mut self, agent: Agent, id: &str) {
+        let Some(session) = self.sessions.iter().find(|s| s.agent == agent && s.id == id) else { return };
+        let found = shell::jump_to(agent, &session.source, &session.project);
+        self.after_jump(agent, found);
+    }
+
+    fn jump_to_run(&mut self, at_ms: u64) {
+        let Some(run) = self.runs.iter().find(|r| r.at_ms == at_ms) else { return };
+        let (agent, found) = (run.agent, shell::jump_to(run.agent, &run.source, &run.project));
+        self.after_jump(agent, found);
+    }
+
+    fn after_jump(&mut self, agent: Agent, found: bool) {
+        if !found {
+            self.peek_text = format!("Could not find the {} window", agent.name());
+            self.peek_status = Status::Waiting;
+            self.flashing = true;
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_FLASH, FLASH_MS, None);
+            }
+            self.settle();
+        }
+    }
+
+    /// The wheel scrolls a long list of finished runs, and otherwise moves between tabs.
+    fn wheel(&mut self, down: bool) {
+        let over_tabs = matches!(self.hovered, Some(Action::Tab(_)));
+        let last = visible_runs(&self.runs, &self.config, agents::now_ms()).len().saturating_sub(view::RUN_ROWS);
+        let on_runs = self.config.tab == Tab::Agents && self.selected.is_none() && self.selected_run.is_none() && !agents::any_live(&self.sessions);
+        if !over_tabs && on_runs && last > 0 {
+            self.runs_scroll = if down { (self.runs_scroll + 1).min(last) } else { self.runs_scroll.saturating_sub(1) };
+            self.hovered = None;
+            self.dirty = true;
+        } else {
+            self.next_tab(down);
+        }
     }
 
     fn next_tab(&mut self, forward: bool) {
@@ -316,6 +381,8 @@ impl App {
         self.update_region();
         let open_h = layout::shape_for(Mode::Open).h;
         let tabs = self.tabs();
+        let now_ms = agents::now_ms();
+        let runs = visible_runs(&self.runs, &self.config, now_ms);
         let Some(gfx) = self.gfx.as_mut() else {
             self.dirty = false;
             return;
@@ -330,6 +397,11 @@ impl App {
             lyrics_on: self.config.lyrics,
             lyric_lines: &self.lyric_lines,
             selected: self.selected.as_ref().and_then(|(agent, id)| self.sessions.iter().find(|s| s.agent == *agent && s.id == *id)),
+            selected_run: self.selected_run.and_then(|at| runs.iter().find(|r| r.at_ms == at).copied()),
+            runs: &runs,
+            runs_scroll: self.runs_scroll,
+            following: (self.config.track_claude, self.config.track_codex),
+            now_ms,
             pill: if self.config.agents { agents::pill_state(&self.sessions) } else { agents::Pill::Quiet },
             sessions: &self.sessions,
             peek: Some(&self.peek_text),
@@ -350,12 +422,17 @@ impl App {
     /// Creates the surface at this display's scale and puts the window at the top centre of the main screen.
     pub fn recreate_graphics(&mut self) {
         self.gfx = None;
+        let area = shell::display_rect(&self.config.display);
+        // Move first: the display decides the scale.
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), area.left, area.top, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+        }
         let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96);
         let scale = dpi as f32 / 96.0;
         let (w, h) = ((CANVAS_W * scale) as i32, (CANVAS_H * scale) as i32);
         unsafe {
-            let screen_w = GetSystemMetrics(SM_CXSCREEN);
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), (screen_w - w) / 2, 0, w, h, SWP_NOACTIVATE);
+            let screen_w = area.right - area.left;
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), area.left + (screen_w - w) / 2, area.top, w, h, SWP_NOACTIVATE);
         }
         self.region = (0, 0);
         self.gfx = match Gfx::new(self.hwnd, w as u32, h as u32, scale) {
@@ -441,8 +518,16 @@ impl App {
                 self.hovered = None;
                 self.settle();
             }
+            Some(Action::OpenRun(at_ms)) => {
+                self.selected_run = Some(at_ms);
+                self.hovered = None;
+                self.settle();
+            }
+            Some(Action::Jump(agent, id)) => self.jump(agent, &id),
+            Some(Action::JumpRun(at_ms)) => self.jump_to_run(at_ms),
             Some(Action::Back) => {
                 self.selected = None;
+                self.selected_run = None;
                 self.auto_selected = false;
                 self.hovered = None;
                 self.settle();
@@ -512,6 +597,20 @@ impl App {
     }
 }
 
+/// The finished runs the agents page may show.
+fn visible_runs<'a>(runs: &'a [Run], config: &Config, now: u64) -> Vec<&'a Run> {
+    if !config.recent {
+        return vec![];
+    }
+    runs.iter()
+        .filter(|r| r.is_recent(now))
+        .filter(|r| match r.agent {
+            Agent::Claude => config.track_claude,
+            Agent::Codex => config.track_codex,
+        })
+        .collect()
+}
+
 fn song_key(media: &Media) -> String {
     format!("{}\u{1}{}", media.title, media.artist)
 }
@@ -538,7 +637,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => app.mouse_move(lparam),
         WM_MOUSELEAVE => app.mouse_leave(),
         WM_LBUTTONUP => app.click(lparam),
-        WM_WHEEL => app.next_tab(((wparam.0 >> 16) as u16 as i16) < 0),
+        WM_WHEEL => app.wheel(((wparam.0 >> 16) as u16 as i16) < 0),
         WM_RBUTTONUP => shell::show_menu(app),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR => {
@@ -586,7 +685,12 @@ fn main() {
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
 
         let config = Config::load();
+        let mut runs = config::load_runs();
+        runs.retain(|r| r.is_recent(agents::now_ms()));
         let hub = Arc::new(Mutex::new(Hub::default()));
+        if let Ok(mut hub) = hub.lock() {
+            hub.recent = runs.clone();
+        }
         let media_state = Arc::new(Mutex::new(Media::default()));
         let secret = hooks::token(&config::dir());
         hooks::serve(hub.clone(), secret.clone(), tell_window);
@@ -628,6 +732,9 @@ fn main() {
             selected: None,
             auto_selected: false,
             viewed_agents: false,
+            runs,
+            selected_run: None,
+            runs_scroll: 0,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

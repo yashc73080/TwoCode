@@ -1,6 +1,6 @@
 //! Allow and Deny from the notch: a small local server for Claude Code hooks, and adding those hooks to settings.json.
 //! Tracking works without any of this; it reads the transcripts.
-use crate::agents::{self, Agent, Hub};
+use crate::agents::{self, Agent, Approval, DiffLine, Hub};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
@@ -58,7 +58,7 @@ pub fn serve(hub: Arc<Mutex<Hub>>, secret: String, on_change: impl Fn() + Send +
 
 fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dyn Fn() + Send + Sync)) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let Some(body) = read_request(&mut stream, secret) else {
+    let Some((body, agent)) = read_request(&mut stream, secret) else {
         respond(&mut stream, "403 Forbidden", "");
         return;
     };
@@ -78,13 +78,11 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
     let hub_for_hangup = hub;
     if let Ok(mut hub) = hub.lock() {
         for event in agents::parse_hook(&data) {
-            hub.apply(Agent::Claude, &id, now, event, now);
+            hub.apply(agent, &id, now, event, now);
         }
         if holds {
             let label = agents::tool_label(tool, &data["tool_input"]);
-            let input = &data["tool_input"];
-            let what = ["command", "file_path", "url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or(tool);
-            let what = what.chars().take(400).collect::<String>();
+            let approval = approval_for(tool, &data["tool_input"]);
             let mut held = stream.try_clone().ok();
             if let Some(conn) = held.take() {
                 let mut conn = conn;
@@ -92,7 +90,7 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
                     respond(&mut conn, "200 OK", answer.as_deref().unwrap_or(""));
                     let _ = conn.shutdown(std::net::Shutdown::Write);
                 });
-                hub.hold(Agent::Claude, &id, label, what, data["tool_input"].clone(), responder, now);
+                hub.hold(agent, &id, label, approval, data["tool_input"].clone(), responder, now);
                 drop(hub);
                 on_change();
                 // Stay on this thread until the agent closes the connection, so a request
@@ -101,7 +99,7 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
                 let mut byte = [0u8; 1];
                 while matches!(stream.read(&mut byte), Ok(n) if n > 0) {}
                 if let Ok(mut hub) = hub_for_hangup.lock() {
-                    if hub.hung_up(Agent::Claude, &id, now) {
+                    if hub.hung_up(agent, &id, now) {
                         drop(hub);
                         on_change();
                     }
@@ -114,7 +112,38 @@ fn handle(mut stream: TcpStream, hub: &Mutex<Hub>, secret: &str, on_change: &(dy
     on_change();
 }
 
-fn read_request(stream: &mut TcpStream, secret: &str) -> Option<Vec<u8>> {
+/// What to show for a request: the exact command, or the first changed lines of an edit.
+pub fn approval_for(tool: &str, input: &Value) -> Approval {
+    let file = input["file_path"].as_str().unwrap_or("");
+    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let first = |key: &str| input[key].as_str().map(str::to_string);
+    if let (Some(old), Some(new)) = (first("old_string"), first("new_string")) {
+        return Approval { title: format!("Wants to edit {name}"), what: file.to_string(), diff: changed_lines(&old, &new) };
+    }
+    if let Some(content) = first("content") {
+        return Approval { title: format!("Wants to write {name}"), what: file.to_string(), diff: changed_lines("", &content) };
+    }
+    if let Some(command) = first("command") {
+        return Approval { title: "Wants to run".to_string(), what: command.chars().take(400).collect(), diff: vec![] };
+    }
+    let what = ["file_path", "url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or(tool);
+    Approval { title: format!("Wants to use {tool}"), what: what.chars().take(400).collect(), diff: vec![] }
+}
+
+/// The first removed and added lines, skipping what both sides share.
+fn changed_lines(old: &str, new: &str) -> Vec<DiffLine> {
+    let shared = |line: &&str| !line.trim().is_empty();
+    let old_lines: Vec<&str> = old.lines().filter(shared).collect();
+    let new_lines: Vec<&str> = new.lines().filter(shared).collect();
+    let removed = old_lines.iter().find(|l| !new_lines.contains(l));
+    let added: Vec<&&str> = new_lines.iter().filter(|l| !old_lines.contains(l)).collect();
+    let line = |added: bool, text: &str| DiffLine { added, text: text.trim().chars().take(120).collect() };
+    let mut out: Vec<DiffLine> = removed.map(|r| line(false, r)).into_iter().collect();
+    out.extend(added.iter().take(2 - out.len()).map(|a| line(true, a)));
+    out
+}
+
+fn read_request(stream: &mut TcpStream, secret: &str) -> Option<(Vec<u8>, Agent)> {
     let mut data = vec![];
     let mut buf = [0u8; 8192];
     let header_end = loop {
@@ -131,9 +160,12 @@ fn read_request(stream: &mut TcpStream, secret: &str) -> Option<Vec<u8>> {
     let mut lines = head.split("\r\n");
     let first = lines.next()?;
     let mut parts = first.split(' ');
-    if parts.next()? != "POST" || parts.next()?.split('?').next()? != ROUTE {
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if method != "POST" || target.split('?').next()? != ROUTE {
         return None;
     }
+    let agent = if target.contains("agent=codex") { Agent::Codex } else { Agent::Claude };
     let (mut given, mut length) = ("", 0usize);
     for line in lines {
         let (name, value) = line.split_once(':')?;
@@ -154,7 +186,7 @@ fn read_request(stream: &mut TcpStream, secret: &str) -> Option<Vec<u8>> {
         }
         body.extend_from_slice(&buf[..n]);
     }
-    Some(body)
+    Some((body, agent))
 }
 
 /// Comparison that takes the same time wherever the first difference is.
@@ -227,6 +259,76 @@ pub fn has_current(settings: &Value, secret: &str) -> bool {
             })
         })
     })
+}
+
+// ---- ~/.codex/hooks.json ----
+
+fn codex_command(secret: &str) -> String {
+    format!(r#"curl.exe -s -m 65 -H "X-TwoCode-Token: {secret}" -H "Content-Type: application/json" --data-binary @- "{}&agent=codex""#, hook_url())
+}
+
+fn is_ours_codex(hook: &Value) -> bool {
+    hook["command"].as_str().is_some_and(|c| c.contains(&format!("127.0.0.1:{PORT}{ROUTE}")))
+}
+
+pub fn strip_codex(config: &mut Value) {
+    if let Some(hooks) = config["hooks"].as_object_mut() {
+        hooks.retain(|_, groups| {
+            if let Some(list) = groups.as_array_mut() {
+                for group in list.iter_mut() {
+                    if let Some(inner) = group["hooks"].as_array_mut() {
+                        inner.retain(|h| !is_ours_codex(h));
+                    }
+                }
+                list.retain(|g| g["hooks"].as_array().is_none_or(|h| !h.is_empty()));
+                !list.is_empty()
+            } else {
+                true
+            }
+        });
+        if hooks.is_empty() {
+            config.as_object_mut().map(|o| o.remove("hooks"));
+        }
+    }
+}
+
+pub fn add_codex(config: &mut Value, secret: &str) {
+    strip_codex(config);
+    if !config["hooks"].is_object() {
+        config["hooks"] = json!({});
+    }
+    let groups = &mut config["hooks"]["PermissionRequest"];
+    if !groups.is_array() {
+        *groups = json!([]);
+    }
+    let hook = json!({ "type": "command", "command": codex_command(secret), "timeout": 70, "statusMessage": "Waiting for TwoCode" });
+    groups.as_array_mut().map(|g| g.push(json!({ "hooks": [hook] })));
+}
+
+pub fn has_codex(config: &Value, secret: &str) -> bool {
+    config["hooks"]["PermissionRequest"].as_array().is_some_and(|groups| {
+        groups.iter().any(|g| g["hooks"].as_array().is_some_and(|hooks| hooks.iter().any(|h| h["command"].as_str() == Some(codex_command(secret).as_str()))))
+    })
+}
+
+fn codex_file() -> std::path::PathBuf {
+    let home = std::env::var_os("CODEX_HOME").map_or_else(|| Path::new(&std::env::var_os("USERPROFILE").unwrap_or_default()).join(".codex"), std::path::PathBuf::from);
+    home.join("hooks.json")
+}
+
+pub fn codex_installed(secret: &str) -> bool {
+    read_settings(&codex_file()).is_ok_and(|c| has_codex(&c, secret))
+}
+
+pub fn set_codex_installed(on: bool, secret: &str) -> Result<(), String> {
+    let file = codex_file();
+    let mut config = read_settings(&file)?;
+    if on {
+        add_codex(&mut config, secret);
+    } else {
+        strip_codex(&mut config);
+    }
+    write_settings(&file, &config)
 }
 
 fn settings_file() -> std::path::PathBuf {
@@ -318,6 +420,31 @@ mod tests {
         let mut s = json!({ "statusLine": { "command": "node twocode-statusline.cjs x" } });
         strip(&mut s);
         assert!(s.get("statusLine").is_none());
+    }
+
+    #[test]
+    fn codex_hooks_come_and_go_without_touching_yours() {
+        let mut c = json!({ "hooks": { "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "mine" }] }], "Stop": [{ "hooks": [{ "type": "command", "command": "other" }] }] } });
+        add_codex(&mut c, "secret");
+        assert!(has_codex(&c, "secret"));
+        assert_eq!(c["hooks"]["PermissionRequest"].as_array().unwrap().len(), 2);
+        assert!(c["hooks"]["PermissionRequest"][1]["hooks"][0]["command"].as_str().unwrap().contains("agent=codex"));
+        strip_codex(&mut c);
+        assert!(!has_codex(&c, "secret"));
+        assert_eq!(c["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "mine");
+        assert_eq!(c["hooks"]["Stop"][0]["hooks"][0]["command"], "other");
+    }
+
+    #[test]
+    fn approvals_show_what_will_change() {
+        let edit = approval_for("Edit", &json!({ "file_path": "C:\\x\\a.rs", "old_string": "keep\nconst A = 1;", "new_string": "keep\nconst A = 2;" }));
+        assert_eq!(edit.title, "Wants to edit a.rs");
+        assert_eq!(edit.diff[0], DiffLine { added: false, text: "const A = 1;".into() });
+        assert_eq!(edit.diff[1], DiffLine { added: true, text: "const A = 2;".into() });
+        let write = approval_for("Write", &json!({ "file_path": "b.txt", "content": "one\ntwo\nthree" }));
+        assert_eq!((write.title.as_str(), write.diff.len()), ("Wants to write b.txt", 2));
+        let run = approval_for("Bash", &json!({ "command": "npm i" }));
+        assert_eq!((run.title.as_str(), run.what.as_str()), ("Wants to run", "npm i"));
     }
 
     #[test]

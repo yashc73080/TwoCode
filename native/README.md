@@ -26,6 +26,8 @@ The app is `target/release/twocode.exe`. Right-click the notch or its tray icon 
 | `src/gfx.rs` | Direct2D and DirectComposition |
 | `src/shell.rs` | Tray menu, start with Windows, full-screen detection |
 
-Tracking only reads local files and changes none of your settings. Turning on **Allow or Deny from the notch** adds hooks to `~/.claude/settings.json`, keeping a backup next to it. Turning it off removes them, including any left by the old Electron TwoCode.
+Tracking only reads local files and changes none of your settings. Turning on **Allow or Deny from the notch** adds hooks to `~/.claude/settings.json` or `~/.codex/hooks.json`, keeping a backup next to the file. Codex asks you to trust a new hook once. Turning it off removes them, including any left by the old Electron TwoCode.
+
+When no agent is working, the agents page lists what finished in the last 3 hours. Those runs are saved to `recent.json` on this PC, including what you asked and which files changed, and older ones are dropped. Turn off **Show recent runs** to hide them and stop saving new ones.
 
 Settings and the log are in `%APPDATA%\TwoCode`.
