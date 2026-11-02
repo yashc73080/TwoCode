@@ -14,6 +14,7 @@ const MEDIA_LYRICS_W: f32 = 540.0;
 const AGENTS_W: f32 = 440.0;
 const CALENDAR_W: f32 = 380.0;
 pub const LYRIC_TEXT: f32 = 12.5;
+pub const STRIP_CLOSE_W: f32 = 28.0;
 const LYRIC_PAD: f32 = 26.0;
 const LYRIC_MIN_W: f32 = 140.0;
 const LYRIC_MAX_W: f32 = 560.0;

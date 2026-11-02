@@ -23,6 +23,7 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(180);
 const LOOK_AHEAD_MS: u64 = 7 * 24 * 3_600_000;
 const MAX_EVENTS: usize = 20;
 const DAY_MS: i64 = 86_400_000;
+const REMIND_BEFORE_MS: u64 = 5 * 60_000;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum Phase {
@@ -570,6 +571,20 @@ pub fn when(event: &Event, now: u64) -> String {
     }
 }
 
+/// The next event starting within 5 minutes that you haven't dismissed. All-day events don't start at a moment.
+pub fn reminder<'a>(events: &'a [Event], now: u64, dismissed: &[(String, u64)]) -> Option<&'a Event> {
+    events
+        .iter()
+        .filter(|e| !e.all_day && e.start_ms > now && e.start_ms - now <= REMIND_BEFORE_MS)
+        .filter(|e| !dismissed.iter().any(|(title, start)| *title == e.title && *start == e.start_ms))
+        .min_by_key(|e| e.start_ms)
+}
+
+/// "Standup in 5m". The last minute still reads "in 1m".
+pub fn reminder_text(event: &Event, now: u64) -> String {
+    format!("{} {}", event.title, countdown(event.start_ms.saturating_sub(now)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +655,36 @@ mod tests {
         assert_eq!((video.title.as_str(), video.join.as_deref()), ("(No title)", Some("https://zoom.us/j/1")));
         let day = parse_event(&json!({ "start": { "date": "2026-11-01" }, "end": { "date": "2026-11-02" } })).unwrap();
         assert!(day.all_day && day.end_ms > day.start_ms);
+    }
+
+    fn at(title: &str, start_ms: u64, all_day: bool) -> Event {
+        Event { title: title.to_string(), start_ms, end_ms: start_ms + 1, all_day, join: None, link: String::new() }
+    }
+
+    #[test]
+    fn reminders_start_five_minutes_before_and_end_at_the_start() {
+        let events = [at("Standup", 1_000_000, false)];
+        assert!(reminder(&events, 1_000_000 - 5 * 60_000 - 1, &[]).is_none());
+        assert!(reminder(&events, 1_000_000 - 5 * 60_000, &[]).is_some());
+        assert!(reminder(&events, 999_999, &[]).is_some());
+        assert!(reminder(&events, 1_000_000, &[]).is_none());
+        assert_eq!(reminder_text(&events[0], 1_000_000 - 5 * 60_000), "Standup in 5m");
+        assert_eq!(reminder_text(&events[0], 1_000_000 - 30_000), "Standup in 1m");
+    }
+
+    #[test]
+    fn all_day_events_never_remind() {
+        assert!(reminder(&[at("Holiday", 1_000_000, true)], 999_000, &[]).is_none());
+    }
+
+    #[test]
+    fn dismissing_moves_on_to_the_next_event_only() {
+        let events = [at("Later", 1_100_000, false), at("First", 1_000_000, false)];
+        assert_eq!(reminder(&events, 900_000, &[]).unwrap().title, "First");
+        let dismissed = [("First".to_string(), 1_000_000)];
+        assert_eq!(reminder(&events, 900_000, &dismissed).unwrap().title, "Later");
+        let both = [("First".to_string(), 1_000_000), ("Later".to_string(), 1_100_000)];
+        assert!(reminder(&events, 900_000, &both).is_none());
     }
 
     #[test]

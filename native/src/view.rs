@@ -49,6 +49,7 @@ pub enum Action {
     ShelfOpen(String),
     ShelfRemove(String),
     ShelfClear,
+    DismissReminder,
     CalendarConnect,
     OpenUrl(String),
     OpenFolder,
@@ -77,6 +78,7 @@ pub struct Scene<'a> {
     pub calendar: &'a calendar::State,
     pub page_scroll: usize,
     pub wave: &'a audio::Levels,
+    pub reminder: Option<&'a str>,
     pub tab_reveal: f32,
     pub tab_position: f32,
     pub now_ms: u64,
@@ -118,7 +120,10 @@ pub fn draw(g: &mut Gfx, s: &Scene, hits: &mut Vec<(Rect, Action)>) {
     match s.mode {
         Mode::Open if open > 0.0 => draw_open(g, s, area, open, hits),
         Mode::Peek if s.shape.h > 22.0 => draw_peek(g, s, area),
-        Mode::Lyric if s.shape.h > 18.0 => draw_lyric_strip(g, s, area),
+        Mode::Lyric if s.shape.h > 18.0 => match s.reminder {
+            Some(text) => draw_reminder(g, s, text, area, hits),
+            None => draw_lyric_strip(g, s, area),
+        },
         _ => {}
     }
     g.unclip();
@@ -128,6 +133,19 @@ fn draw_peek(g: &mut Gfx, s: &Scene, a: Rect) {
     let Some(text) = s.peek else { return };
     g.circle(a.x + 20.0, a.h / 2.0, 4.0, status_colour(s.peek_status), 1.0);
     g.text(text, Rect { x: a.x + 32.0, y: 0.0, w: a.w - 46.0, h: a.h }, 12.0, true, Align::Left, WHITE, 1.0);
+}
+
+/// A meeting about to start, with an × that puts the pill back.
+fn draw_reminder(g: &mut Gfx, s: &Scene, text: &str, a: Rect, hits: &mut Vec<(Rect, Action)>) {
+    g.circle(a.x + 14.0, a.h / 2.0, 3.5, AMBER, 1.0);
+    g.text(text, Rect { x: a.x + 24.0, y: 0.0, w: a.w - 24.0 - layout::STRIP_CLOSE_W, h: a.h }, layout::LYRIC_TEXT, true, Align::Left, WHITE, 1.0);
+    let close = Rect { x: a.x + a.w - layout::STRIP_CLOSE_W, y: 0.0, w: layout::STRIP_CLOSE_W, h: a.h };
+    let over = is_hovered(s, &Action::DismissReminder);
+    if over {
+        g.circle(close.x + close.w / 2.0, a.h / 2.0, 9.0, WHITE, 0.18);
+    }
+    g.text("×", close, 15.0, false, Align::Center, if over { WHITE } else { MUTED }, 1.0);
+    hits.push((close, Action::DismissReminder));
 }
 
 /// The line being sung. The pill's colour is hidden behind this, so agent news shows as a small dot.

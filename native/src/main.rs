@@ -47,6 +47,8 @@ const TIMER_FLASH: usize = 4;
 const TIMER_FULLSCREEN: usize = 5;
 const TIMER_RETRY: usize = 6;
 const TIMER_WAVE: usize = 7;
+const TIMER_REMINDER: usize = 8;
+const REMINDER_CHECK_MS: u32 = 15_000;
 const WAVE_FRAME_MS: u32 = 33;
 const WM_WHEEL: u32 = 0x020A;
 const DRAG_START_PX: f32 = 5.0;
@@ -123,6 +125,8 @@ pub struct App {
     opened_by_hover: bool,
     menu: Option<HWND>,
     menu_holds_open: bool,
+    reminder: Option<calendar::Event>,
+    dismissed: Vec<(String, u64)>,
     tab_reveal: f32,
     tab_position: f32,
     tabs_clock: Instant,
@@ -305,14 +309,17 @@ impl App {
         // Typing or dragging a file holds the notch open, like the mouse does.
         let held = self.hovering || self.edit.is_some() || self.shelf_receiving || self.menu_holds_open;
         let has_tabs = !self.tabs().is_empty();
-        let mut next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, self.lyric_strip_ready());
+        self.reminder = self.current_reminder();
+        let strip = self.reminder.is_some() || self.lyric_strip_ready();
+        let mut next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, strip);
         // Only closing it yourself from the lyrics view leaves the line showing. A question that opened it decides nothing.
         if next != Mode::Open && self.mode == Mode::Open {
             if self.opened_by_hover {
                 self.lyric_strip = self.lyrics_view_showing();
             }
             self.opened_by_hover = false;
-            next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, self.lyric_strip_ready());
+            let strip = self.reminder.is_some() || self.lyric_strip_ready();
+            next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, strip);
         }
         if next == Mode::Open && self.hovering {
             self.opened_by_hover = true;
@@ -347,7 +354,8 @@ impl App {
                 SetTimer(Some(self.hwnd), TIMER_TICK, if singing { 200 } else { 1000 }, None);
             } else if next == Mode::Lyric {
                 // Wakes when the line changes, and otherwise rarely.
-                let wait = lyrics::ms_to_next(&self.lyric_lines, self.media.position_now()).unwrap_or(1000).clamp(40, 1000);
+                let next_line = if self.reminder.is_some() { None } else { lyrics::ms_to_next(&self.lyric_lines, self.media.position_now()) };
+                let wait = next_line.unwrap_or(1000).clamp(40, 1000);
                 SetTimer(Some(self.hwnd), TIMER_TICK, wait as u32, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), TIMER_TICK);
@@ -365,7 +373,18 @@ impl App {
         self.lyric_strip && self.config.media && self.config.lyrics && self.media.present && self.media.playing && !self.lyric_lines.is_empty()
     }
 
+    fn current_reminder(&self) -> Option<calendar::Event> {
+        if !self.config.calendar || self.calendar.phase != calendar::Phase::Ready {
+            return None;
+        }
+        calendar::reminder(&self.calendar.events, agents::now_ms(), &self.dismissed).cloned()
+    }
+
     fn lyric_width(&mut self) -> f32 {
+        if let Some(event) = &self.reminder {
+            let text = calendar::reminder_text(event, agents::now_ms());
+            return self.gfx.as_mut().map_or(0.0, |g| g.text_width(&text, layout::LYRIC_TEXT, true)) + layout::STRIP_CLOSE_W;
+        }
         let position = self.media.position_now();
         let text = lyrics::current_line(&self.lyric_lines, position).map_or("♪".to_string(), |i| self.lyric_lines[i].text.clone());
         self.gfx.as_mut().map_or(0.0, |g| g.text_width(&text, layout::LYRIC_TEXT, true))
@@ -617,6 +636,7 @@ impl App {
         let open_h = layout::shape_for(Mode::Open).h;
         let tabs = self.tabs();
         let picker_moving = self.move_tab_picker(&tabs);
+        let reminder_text = self.reminder.as_ref().map(|e| calendar::reminder_text(e, agents::now_ms()));
         let now_ms = agents::now_ms();
         let runs = visible_runs(&self.runs, &self.config, now_ms);
         let Some(gfx) = self.gfx.as_mut() else {
@@ -644,6 +664,7 @@ impl App {
             calendar: &self.calendar,
             page_scroll: self.page_scroll,
             wave: &self.wave,
+            reminder: reminder_text.as_deref(),
             tab_reveal: self.tab_reveal,
             tab_position: self.tab_position,
             now_ms,
@@ -756,13 +777,16 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_CLOSE);
         }
-        if !self.hovering {
-            unsafe {
+        let (x, y) = self.to_canvas(lparam);
+        let hit = self.hit_at(x, y);
+        // Aiming for the reminder's × shouldn't open the notch out from under it.
+        unsafe {
+            if matches!(hit, Some(Action::DismissReminder)) {
+                let _ = KillTimer(Some(hwnd), TIMER_OPEN);
+            } else if !self.hovering {
                 SetTimer(Some(hwnd), TIMER_OPEN, OPEN_DELAY_MS, None);
             }
         }
-        let (x, y) = self.to_canvas(lparam);
-        let hit = self.hit_at(x, y);
         if hit != self.hovered {
             self.hovered = hit;
             self.dirty = true;
@@ -834,6 +858,13 @@ impl App {
                 shelf::save(&self.shelf);
                 self.hovered = None;
             }
+            Some(Action::DismissReminder) => {
+                if let Some(event) = self.reminder.take() {
+                    self.dismissed.push((event.title, event.start_ms));
+                }
+                self.hovered = None;
+                self.settle();
+            }
             Some(Action::ShelfClear) => {
                 self.shelf.clear();
                 shelf::save(&self.shelf);
@@ -889,7 +920,7 @@ impl App {
 
     fn timer(&mut self, id: usize) {
         unsafe {
-            if id != TIMER_TICK && id != TIMER_FULLSCREEN && id != TIMER_WAVE {
+            if id != TIMER_TICK && id != TIMER_FULLSCREEN && id != TIMER_WAVE && id != TIMER_REMINDER {
                 let _ = KillTimer(Some(self.hwnd), id);
             }
         }
@@ -907,6 +938,11 @@ impl App {
                 self.settle();
             }
             TIMER_TICK => self.pull_state(),
+            TIMER_REMINDER => {
+                if self.current_reminder() != self.reminder {
+                    self.settle();
+                }
+            }
             TIMER_WAVE => {
                 let levels = self.wave_state.lock().map_or([0.0; audio::BARS], |w| *w);
                 if levels != self.wave {
@@ -1104,6 +1140,8 @@ fn main() {
             opened_by_hover: false,
             menu: None,
             menu_holds_open: false,
+            reminder: None,
+            dismissed: vec![],
             tab_reveal: 0.0,
             tab_position: 0.0,
             tabs_clock: Instant::now(),
@@ -1115,6 +1153,7 @@ fn main() {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         shell::add_tray(hwnd);
         SetTimer(Some(hwnd), TIMER_FULLSCREEN, 3000, None);
+        SetTimer(Some(hwnd), TIMER_REMINDER, REMINDER_CHECK_MS, None);
         let _ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(foreground_changed), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         // Between animations this waits in GetMessage, so an idle notch uses no processor time.

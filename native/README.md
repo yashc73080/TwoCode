@@ -48,6 +48,8 @@ The Calendar tab reads your events and can't change them. It needs your own Goog
 3. Under **Credentials**, create an **OAuth client ID** of type **Desktop app** and download its JSON.
 4. Save that file as `%APPDATA%\TwoCode\google-client.json`, then press **Connect** in the Calendar tab.
 
+Five minutes before a timed event starts, the closed notch shows its name and a countdown. The × puts the pill back for that event.
+
 While the Google project is in testing mode, Google ends the sign-in after 7 days and you have to connect again. Your sign-in is saved encrypted for your Windows account in `google-token.bin`, and **Disconnect Google Calendar** in the menu removes it and asks Google to cancel it.
 
 Settings and the log are in `%APPDATA%\TwoCode`.
