@@ -122,6 +122,10 @@ pub struct App {
     lyric_strip: bool,
     opened_by_hover: bool,
     menu: Option<HWND>,
+    menu_holds_open: bool,
+    tab_reveal: f32,
+    tab_position: f32,
+    tabs_clock: Instant,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -299,7 +303,7 @@ impl App {
             self.give_focus_back();
         }
         // Typing or dragging a file holds the notch open, like the mouse does.
-        let held = self.hovering || self.edit.is_some() || self.shelf_receiving;
+        let held = self.hovering || self.edit.is_some() || self.shelf_receiving || self.menu_holds_open;
         let has_tabs = !self.tabs().is_empty();
         let mut next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, self.lyric_strip_ready());
         // Only closing it yourself from the lyrics view leaves the line showing. A question that opened it decides nothing.
@@ -612,6 +616,7 @@ impl App {
         self.update_region();
         let open_h = layout::shape_for(Mode::Open).h;
         let tabs = self.tabs();
+        let picker_moving = self.move_tab_picker(&tabs);
         let now_ms = agents::now_ms();
         let runs = visible_runs(&self.runs, &self.config, now_ms);
         let Some(gfx) = self.gfx.as_mut() else {
@@ -639,6 +644,8 @@ impl App {
             calendar: &self.calendar,
             page_scroll: self.page_scroll,
             wave: &self.wave,
+            tab_reveal: self.tab_reveal,
+            tab_position: self.tab_position,
             now_ms,
             pill: if self.config.agents { agents::pill_state(&self.sessions) } else { agents::Pill::Quiet },
             sessions: &self.sessions,
@@ -654,7 +661,23 @@ impl App {
             self.recreate_graphics();
             return;
         }
-        self.dirty = false;
+        self.dirty = picker_moving;
+    }
+
+    /// One step of the tab picker's animation. True if it needs another frame.
+    fn move_tab_picker(&mut self, tabs: &[Tab]) -> bool {
+        let seconds = self.tabs_clock.elapsed().as_secs_f32().min(0.05);
+        self.tabs_clock = Instant::now();
+        let position = tabs.iter().position(|t| *t == self.config.tab).unwrap_or(0) as f32;
+        if self.mode != Mode::Open {
+            self.tab_reveal = 0.0;
+            self.tab_position = position;
+            return false;
+        }
+        let reveal = if matches!(self.hovered, Some(Action::Tab(_))) { 1.0 } else { 0.0 };
+        self.tab_reveal = layout::ease_toward(self.tab_reveal, reveal, seconds);
+        self.tab_position = layout::ease_toward(self.tab_position, position, seconds);
+        self.tab_reveal != reveal || self.tab_position != position
     }
 
     /// Creates the surface at this display's scale and puts the window at the top centre of the main screen.
@@ -1080,6 +1103,10 @@ fn main() {
             lyric_strip: false,
             opened_by_hover: false,
             menu: None,
+            menu_holds_open: false,
+            tab_reveal: 0.0,
+            tab_position: 0.0,
+            tabs_clock: Instant::now(),
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

@@ -148,6 +148,15 @@ impl Gfx {
         }
     }
 
+    /// Until `unscaled`, draws everything larger or smaller around this point.
+    pub fn scaled(&self, cx: f32, cy: f32, by: f32) {
+        unsafe { self.dc.SetTransform(&matrix(self.scale * by, cx * (1.0 - by) * self.scale, cy * (1.0 - by) * self.scale)) }
+    }
+
+    pub fn unscaled(&self) {
+        unsafe { self.dc.SetTransform(&matrix(self.scale, 0.0, 0.0)) }
+    }
+
     pub fn clip(&self, r: Rect) {
         unsafe { self.dc.PushAxisAlignedClip(&d2d_rect(r), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) }
     }

@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 pub const CANVAS_W: f32 = 640.0;
 pub const CANVAS_H: f32 = 170.0;
 const DURATION_MS: f32 = 240.0;
+pub const TAB_DOT_SPACING: f32 = 16.0;
+pub const TAB_ICON_SPACING: f32 = 30.0;
+pub const TAB_ROW_FROM_BOTTOM: f32 = 11.0;
+const TAB_SPEED: f32 = 16.0; // how quickly the picker catches up, per second
 const MEDIA_W: f32 = 320.0;
 const MEDIA_LYRICS_W: f32 = 540.0;
 const AGENTS_W: f32 = 440.0;
@@ -132,6 +136,21 @@ impl Motion {
     }
 }
 
+/// Where tab `index` sits in a centred row. The index can be fractional while the marker slides.
+pub fn tab_x(mid: f32, index: f32, count: usize, spacing: f32) -> f32 {
+    mid + (index - (count as f32 - 1.0) / 2.0) * spacing
+}
+
+/// Moves a value toward its goal, fast at first and gently at the end, however long the frame took.
+pub fn ease_toward(value: f32, goal: f32, seconds: f32) -> f32 {
+    let next = value + (goal - value) * (1.0 - (-TAB_SPEED * seconds).exp());
+    if (goal - next).abs() < 0.004 {
+        goal
+    } else {
+        next
+    }
+}
+
 /// How visible the open page is at this height: nothing until most of the opening is done.
 pub fn content_alpha(current_h: f32, full_h: f32) -> f32 {
     ((current_h / full_h - 0.55) / 0.45).clamp(0.0, 1.0)
@@ -232,6 +251,25 @@ mod tests {
             let s = shape_for(mode);
             assert!(s.w * 1.03 < CANVAS_W && s.h * 1.1 < CANVAS_H, "{mode:?} {s:?}");
         }
+    }
+
+    #[test]
+    fn the_tab_row_is_centred() {
+        assert_eq!(tab_x(100.0, 0.0, 3, 30.0), 70.0);
+        assert_eq!(tab_x(100.0, 1.0, 3, 30.0), 100.0);
+        assert_eq!(tab_x(100.0, 0.5, 2, 30.0), 100.0);
+    }
+
+    #[test]
+    fn easing_arrives_exactly_and_never_overshoots() {
+        let mut value = 0.0;
+        for _ in 0..120 {
+            let next = ease_toward(value, 1.0, 1.0 / 60.0);
+            assert!(next >= value && next <= 1.0);
+            value = next;
+        }
+        assert_eq!(value, 1.0);
+        assert_eq!(ease_toward(0.5, 0.5, 0.1), 0.5);
     }
 
     #[test]

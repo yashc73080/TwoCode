@@ -77,6 +77,8 @@ pub struct Scene<'a> {
     pub calendar: &'a calendar::State,
     pub page_scroll: usize,
     pub wave: &'a audio::Levels,
+    pub tab_reveal: f32,
+    pub tab_position: f32,
     pub now_ms: u64,
     pub peek: Option<&'a str>,
     pub peek_status: Status,
@@ -164,51 +166,43 @@ fn draw_open(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
         Tab::Shelf => draw_shelf(g, s, a, alpha, hits),
     }
     if s.tabs.len() > 1 {
-        draw_dots(g, s, a, alpha, hits);
+        draw_tab_picker(g, s, a, alpha, hits);
     }
 }
 
-/// Dots along the bottom, the chosen one stretched. Pointing at them swaps them for icons.
-fn draw_dots(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
-    if matches!(s.hovered, Some(Action::Tab(_))) {
-        draw_tab_icons(g, s, a, alpha, hits);
-        return;
-    }
-    let (dot, wide, gap, cy) = (6.0, 20.0, 7.0, s.open_h - 8.0);
-    let count = s.tabs.len() as f32;
-    let total = wide + (count - 1.0) * (dot + gap);
-    let mut x = a.x + (a.w - total) / 2.0;
-    for tab in s.tabs {
-        let chosen = *tab == s.tab;
-        let w = if chosen { wide } else { dot };
-        let status = if *tab == Tab::Agents && !chosen { layout::light(s.sessions.iter().map(|v| v.status)) } else { None };
-        let (hex, opacity) = match status {
-            Some(status) => (status_colour(status), 1.0),
-            None if chosen => (WHITE, 0.95),
-            None => (WHITE, 0.4),
-        };
-        g.fill(Rect { x, y: cy - dot / 2.0, w, h: dot }, dot / 2.0, hex, opacity * alpha);
-        hits.push((Rect { x: x - gap / 2.0, y: cy - 11.0, w: w + gap, h: 20.0 }, Action::Tab(*tab)));
-        x += w + gap;
-    }
-}
-
-fn draw_tab_icons(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
-    // Low and slim, in the strip below the page, so it never covers the controls.
-    let (cell, h) = (30.0, 20.0);
-    let total = s.tabs.len() as f32 * cell;
-    let top = s.open_h - h - 1.0;
-    let tray = Rect { x: a.x + (a.w - total) / 2.0 - 4.0, y: top, w: total + 8.0, h };
-    g.fill(tray, h / 2.0, 0x1C1C1E, alpha);
+/// One row that never swaps layouts: pointing at it spreads the dots apart and they become icons,
+/// while one soft marker slides between tabs and grows from a small bar into a highlight behind the icon.
+fn draw_tab_picker(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let mix = |from: f32, to: f32| from + (to - from) * s.tab_reveal;
+    let (mid, cy, count) = (a.x + a.w / 2.0, s.open_h - layout::TAB_ROW_FROM_BOTTOM, s.tabs.len());
+    let spacing = mix(layout::TAB_DOT_SPACING, layout::TAB_ICON_SPACING);
+    let (marker_w, marker_h) = (mix(14.0, 28.0), mix(5.0, 19.0));
+    let marker_x = layout::tab_x(mid, s.tab_position, count, spacing);
+    g.fill(Rect { x: marker_x - marker_w / 2.0, y: cy - marker_h / 2.0, w: marker_w, h: marker_h }, marker_h / 2.0, WHITE, mix(0.95, 0.16) * alpha);
     for (i, tab) in s.tabs.iter().enumerate() {
-        let r = Rect { x: tray.x + 4.0 + i as f32 * cell, y: top, w: cell, h };
+        let x = layout::tab_x(mid, i as f32, count, spacing);
         let action = Action::Tab(*tab);
-        let fill = if *tab == s.tab { 0.2 } else if is_hovered(s, &action) { 0.1 } else { 0.0 };
-        if fill > 0.0 {
-            g.fill(Rect { x: r.x + 2.0, y: r.y + 1.0, w: r.w - 4.0, h: r.h - 2.0 }, (r.h - 2.0) / 2.0, WHITE, fill * alpha);
+        let chosen = *tab == s.tab;
+        let status = if *tab == Tab::Agents && !chosen { layout::light(s.sessions.iter().map(|v| v.status)) } else { None };
+        // A dot is hidden under the marker when its tab is chosen, so only the others show.
+        let closeness = (s.tab_position - i as f32).abs().min(1.0);
+        match status {
+            Some(status) => g.circle(x, cy, 2.75, status_colour(status), (1.0 - s.tab_reveal) * alpha),
+            None => g.circle(x, cy, 2.75, WHITE, 0.4 * closeness * (1.0 - s.tab_reveal) * alpha),
         }
-        draw_tab_icon(g, *tab, r.x + r.w / 2.0, r.y + r.h / 2.0 + 1.5, alpha);
-        hits.push((Rect { y: top, h: s.open_h - top, ..r }, action));
+        if s.tab_reveal > 0.01 {
+            let shade = if chosen || is_hovered(s, &action) { 1.0 } else { 0.55 };
+            g.scaled(x, cy, mix(0.55, 0.82));
+            draw_tab_icon(g, *tab, x, cy + 0.5, shade * s.tab_reveal * alpha);
+            g.unscaled();
+            if let Some(status) = status {
+                g.circle(x + 8.0, cy - 6.0, 2.5, status_colour(status), s.tab_reveal * alpha);
+            }
+        }
+        // The same targets throughout, so the row can't flicker as it moves.
+        let hit_x = layout::tab_x(mid, i as f32, count, layout::TAB_ICON_SPACING);
+        let hit_top = s.open_h - layout::TAB_ROW_FROM_BOTTOM * 2.0 - 1.0;
+        hits.push((Rect { x: hit_x - layout::TAB_ICON_SPACING / 2.0, y: hit_top, w: layout::TAB_ICON_SPACING, h: s.open_h - hit_top }, action));
     }
 }
 

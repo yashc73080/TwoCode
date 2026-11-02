@@ -329,6 +329,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(app) = crate::app(main) {
                 if app.menu == Some(hwnd) {
                     app.menu = None;
+                    // The notch was waiting for this, unless the mouse is on it.
+                    app.menu_holds_open = false;
+                    app.settle();
                 }
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -366,7 +369,9 @@ pub fn open(app: &mut App, from_notch: bool) {
         let mut notch = RECT::default();
         let _ = GetWindowRect(app.hwnd, &mut notch);
         let notch_scale = app.gfx.as_ref().map_or(1.0, |g| g.scale);
-        let anchor = if from_notch { ((notch.left + notch.right) / 2, notch.top + ((app.shape.y + app.shape.h) * notch_scale) as i32) } else { (cursor.x, cursor.y) };
+        // Under the open notch, even if it is only starting to open.
+        let open_h = crate::layout::shape_for(crate::layout::Mode::Open).h;
+        let anchor = if from_notch { ((notch.left + notch.right) / 2, notch.top + (open_h * notch_scale) as i32) } else { (cursor.x, cursor.y) };
         let monitor = MonitorFromPoint(POINT { x: anchor.0, y: anchor.1 }, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(monitor, &mut info);
@@ -395,6 +400,8 @@ pub fn open(app: &mut App, from_notch: bool) {
         let m = Box::into_raw(Box::new(Menu { hwnd, gfx, rows, knobs, hover: None, tracking: false, scroll: 0.0, view_h, focus_before: HWND::default() }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, m as isize);
         app.menu = Some(hwnd);
+        app.menu_holds_open = from_notch;
+        app.settle();
         (*m).render();
         let _ = ShowWindow(hwnd, SW_SHOW);
         let before = shell::take_focus(hwnd);
