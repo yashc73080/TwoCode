@@ -152,6 +152,29 @@ impl Run {
     }
 }
 
+/// The name of the repo a folder belongs to, wherever inside it the agent has moved. A git worktree counts as its main repo.
+pub fn repo_name(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd.trim_end_matches(['/', '\\']));
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    path.ancestors().find_map(|root| {
+        let git = root.join(".git");
+        if git.is_dir() {
+            name(root)
+        } else if git.is_file() {
+            std::fs::read_to_string(&git).ok().and_then(|text| worktree_repo(&text)).or_else(|| name(root))
+        } else {
+            None
+        }
+    })
+}
+
+/// A worktree's .git file says "gitdir: C:/dev/repo/.git/worktrees/name". This finds "repo".
+fn worktree_repo(git_file: &str) -> Option<String> {
+    let target = git_file.trim().strip_prefix("gitdir:")?.trim().replace('\\', "/");
+    let (repo_path, _) = target.split_once("/.git/worktrees/")?;
+    repo_path.rsplit('/').next().filter(|n| !n.is_empty()).map(str::to_string)
+}
+
 /// Is any agent working or waiting? If not, the agents page shows what finished lately.
 pub fn any_live(sessions: &[SessionView]) -> bool {
     sessions.iter().any(|s| matches!(s.status, Status::Running | Status::Waiting))
@@ -171,6 +194,7 @@ struct Session {
     agent: Agent,
     id: String,
     project: String,
+    cwd: String,
     status: Status,
     detail: String,
     started: Option<u64>,
@@ -336,6 +360,7 @@ impl Hub {
             agent,
             id: id.to_string(),
             project: agent.name().to_string(),
+            cwd: String::new(),
             status: Status::Idle,
             detail: String::new(),
             started: None,
@@ -366,9 +391,17 @@ impl Hub {
         }
         let s = self.entry(agent, id, ts);
         if let Event::Meta { cwd } = &event {
-            let name = cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("");
-            if !name.is_empty() {
-                s.project = name.to_string();
+            // Most lines repeat the folder, so the disk is only checked when it changes.
+            if *cwd != s.cwd {
+                // Outside a repo, the folder it started in names it, so a later `cd` doesn't rename the project.
+                let first = s.cwd.is_empty();
+                s.cwd = cwd.clone();
+                let leaf = cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("");
+                match repo_name(cwd) {
+                    Some(repo) => s.project = repo,
+                    None if first && !leaf.is_empty() => s.project = leaf.to_string(),
+                    None => {}
+                }
             }
             return;
         }
@@ -1139,6 +1172,51 @@ mod tests {
         let run = &hub.recent[0];
         assert_eq!((run.prompt.as_str(), run.summary.as_str(), run.failed), ("Fix it", "Changed 1 file · took 1s", false));
         assert!(hub.recent_changed);
+    }
+
+    #[test]
+    fn folders_are_named_from_their_repo() {
+        let root = std::env::temp_dir().join(format!("twocode-label-{}", std::process::id()));
+        let shop = root.join("shop");
+        let deep = shop.join("native").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(shop.join(".git")).unwrap();
+        assert_eq!(repo_name(&shop.to_string_lossy()).as_deref(), Some("shop"));
+        assert_eq!(repo_name(&deep.to_string_lossy()).as_deref(), Some("shop"));
+        assert_eq!(repo_name(&format!("{}\\", deep.display())).as_deref(), Some("shop"));
+
+        let worktree = root.join("feature-a").join("src");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(root.join("feature-a").join(".git"), "gitdir: C:/dev/TwoCode/.git/worktrees/feature-a\n").unwrap();
+        assert_eq!(repo_name(&worktree.to_string_lossy()).as_deref(), Some("TwoCode"));
+        assert_eq!(repo_name("Z:\\no\\such\\folder"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn outside_a_repo_the_starting_folder_names_the_session() {
+        let mut hub = Hub::default();
+        hub.apply(Agent::Claude, "s", NOW, Event::Meta { cwd: "Z:\\dev\\shop".into() }, NOW);
+        hub.apply(Agent::Claude, "s", NOW, Event::Meta { cwd: "Z:\\dev\\shop\\src".into() }, NOW);
+        hub.apply(Agent::Claude, "s", NOW, Event::Turn, NOW);
+        assert_eq!(hub.view(NOW)[0].project, "shop");
+    }
+
+    #[test]
+    fn two_claude_sessions_stay_separate_even_in_one_folder() {
+        let mut hub = Hub::default();
+        for id in ["one", "two"] {
+            hub.apply(Agent::Claude, id, NOW, Event::Meta { cwd: "Z:\\dev\\shop".into() }, NOW);
+            hub.apply(Agent::Claude, id, NOW, Event::Turn, NOW);
+        }
+        hub.apply(Agent::Claude, "one", NOW, Event::Tool { label: "Editing a.rs".into() }, NOW);
+        hub.apply(Agent::Claude, "two", NOW, Event::Done, NOW);
+        let view = hub.view(NOW);
+        assert_eq!(view.len(), 2);
+        let one = view.iter().find(|v| v.id == "one").unwrap();
+        let two = view.iter().find(|v| v.id == "two").unwrap();
+        assert_eq!((one.status, one.detail.as_str()), (Status::Running, "Editing a.rs"));
+        assert_eq!(two.status, Status::Done);
     }
 
     #[test]
