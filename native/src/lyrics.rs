@@ -144,7 +144,7 @@ pub fn current_line(lines: &[Line], position_ms: u64) -> Option<usize> {
     lines.partition_point(|l| l.at_ms <= position_ms).checked_sub(1)
 }
 
-fn encode(text: &str) -> String {
+pub fn encode(text: &str) -> String {
     let mut out = String::new();
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -169,7 +169,7 @@ fn get(path: &str) -> Option<String> {
         } else {
             WinHttpOpenRequest(connection, w!("GET"), &wide, PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE)
         };
-        let body = if request.is_null() { None } else { read_response(request) };
+        let body = if request.is_null() { None } else { read_response(request, true) };
         for handle in [request, connection, session] {
             if !handle.is_null() {
                 let _ = WinHttpCloseHandle(handle);
@@ -179,10 +179,13 @@ fn get(path: &str) -> Option<String> {
     }
 }
 
-unsafe fn read_response(request: *mut core::ffi::c_void) -> Option<String> {
-    let _ = WinHttpSetTimeouts(request, 5000, 5000, 8000, 8000);
-    WinHttpSendRequest(request, None, None, 0, 0, 0).ok()?;
-    WinHttpReceiveResponse(request, std::ptr::null_mut()).ok()?;
+/// Reads the answer's body. `send` is false when the caller already sent its own request.
+pub unsafe fn read_response(request: *mut core::ffi::c_void, send: bool) -> Option<String> {
+    if send {
+        let _ = WinHttpSetTimeouts(request, 5000, 5000, 8000, 8000);
+        WinHttpSendRequest(request, None, None, 0, 0, 0).ok()?;
+        WinHttpReceiveResponse(request, std::ptr::null_mut()).ok()?;
+    }
     let mut body = vec![];
     loop {
         let mut chunk = [0u8; 16 * 1024];

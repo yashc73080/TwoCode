@@ -208,6 +208,20 @@ impl Gfx {
         }
     }
 
+    /// How wide this text is on one line, trailing spaces included.
+    pub fn text_width(&mut self, text: &str, size: f32, bold: bool) -> f32 {
+        let Some(format) = self.format(size, bold, Align::Left, false) else { return 0.0 };
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let Ok(layout) = self.dwrite.CreateTextLayout(&wide, &format, 10_000.0, 100.0) else { return 0.0 };
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut metrics).is_err() {
+                return 0.0;
+            }
+            metrics.widthIncludingTrailingWhitespace
+        }
+    }
+
     fn format(&mut self, size: f32, bold: bool, align: Align, wrap: bool) -> Option<IDWriteTextFormat> {
         let key = ((size * 10.0) as u32, bold, align, wrap);
         if let Some(found) = self.formats.get(&key) {

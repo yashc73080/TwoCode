@@ -18,13 +18,16 @@ pub struct Config {
     pub tab: Tab,
     pub sounds: bool,
     pub recent: bool,
+    pub calendar: bool,
+    pub todos: bool,
+    pub shelf: bool,
     /// Windows' name for the chosen display. Empty or gone means the main one.
     pub display: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_popup: false, hide_fullscreen: true, tab: Tab::Media, sounds: false, recent: true, display: String::new() }
+        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_popup: false, hide_fullscreen: true, tab: Tab::Media, sounds: false, recent: true, calendar: true, todos: true, shelf: true, display: String::new() }
     }
 }
 

@@ -1,13 +1,16 @@
 #![windows_subsystem = "windows"]
 //! TwoCode: a notch at the top of the screen for your media and your coding agents.
 mod agents;
+mod calendar;
 mod config;
 mod gfx;
 mod hooks;
 mod layout;
 mod lyrics;
 mod media;
+mod shelf;
 mod shell;
+mod todos;
 mod view;
 mod watcher;
 
@@ -24,12 +27,12 @@ use view::{Action, Scene};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -42,6 +45,8 @@ const TIMER_FLASH: usize = 4;
 const TIMER_FULLSCREEN: usize = 5;
 const TIMER_RETRY: usize = 6;
 const WM_WHEEL: u32 = 0x020A;
+const DRAG_START_PX: f32 = 5.0;
+const AFTER_DROP_MS: u32 = 1500;
 const OPEN_DELAY_MS: u32 = 110;
 const CLOSE_DELAY_MS: u32 = 320;
 const FLASH_MS: u32 = 4000;
@@ -94,6 +99,18 @@ pub struct App {
     runs: Vec<Run>,
     selected_run: Option<u64>,
     runs_scroll: usize,
+    page_scroll: usize,
+    todos: Vec<todos::Todo>,
+    edit: Option<todos::Edit>,
+    focus_before: HWND,
+    high_surrogate: Option<u16>,
+    shelf: Vec<shelf::Item>,
+    shelf_dropped: Arc<Mutex<Vec<String>>>,
+    shelf_receiving: bool,
+    pressed: Option<(String, f32, f32)>,
+    calendar_state: Arc<Mutex<calendar::State>>,
+    calendar: calendar::State,
+    calendar_tx: Sender<calendar::Command>,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -138,12 +155,16 @@ impl App {
 
     fn open_width(&self) -> f32 {
         let lyrics = self.config.lyrics && !self.lyric_lines.is_empty() && self.media.present;
-        let no_agents = self.sessions.is_empty() && visible_runs(&self.runs, &self.config, agents::now_ms()).is_empty();
-        layout::open_width(self.config.tab, lyrics, no_agents)
+        let now = agents::now_ms();
+        let nothing_listed = match self.config.tab {
+            Tab::Calendar => self.calendar.phase != calendar::Phase::Ready || !self.calendar.events.iter().any(|e| e.end_ms > now),
+            _ => self.sessions.is_empty() && visible_runs(&self.runs, &self.config, now).is_empty(),
+        };
+        layout::open_width(self.config.tab, lyrics, nothing_listed)
     }
 
     fn tabs(&self) -> Vec<Tab> {
-        layout::tabs(self.config.media, self.config.agents)
+        layout::tabs(self.config.media, self.config.agents, self.config.calendar, self.config.todos, self.config.shelf)
     }
 
     /// The tab to show: a question brings you to the agents, and a switched-off feature gives up its tab.
@@ -211,6 +232,16 @@ impl App {
         if let Ok(media) = self.media_state.lock() {
             self.media = media.clone();
         }
+        if let Ok(state) = self.calendar_state.lock() {
+            self.calendar = state.clone();
+        }
+        if self.mode == Mode::Open && self.config.tab == Tab::Shelf {
+            let before = self.shelf.len();
+            self.shelf.retain(|item| std::path::Path::new(&item.path).exists());
+            if self.shelf.len() != before {
+                shelf::save(&self.shelf);
+            }
+        }
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.set_art(self.media.art_rev, self.media.art.as_deref().map(|v| v.as_slice()));
         }
@@ -251,12 +282,24 @@ impl App {
     /// Starts moving toward whatever the notch should be now.
     pub fn settle(&mut self) {
         self.pick_tab();
-        let next = layout::target_mode(self.hovering, self.needs_decision(), self.flashing, !self.tabs().is_empty());
+        shelf::ACCEPTS.store(self.config.shelf, Ordering::SeqCst);
+        if self.edit.is_some() && self.config.tab != Tab::Todos {
+            self.commit_edit();
+            self.give_focus_back();
+        }
+        // Typing or dragging a file holds the notch open, like the mouse does.
+        let held = self.hovering || self.edit.is_some() || self.shelf_receiving;
+        let next = layout::target_mode(held, self.needs_decision(), self.flashing, !self.tabs().is_empty());
+        if next == Mode::Open && self.mode != Mode::Open && self.config.tab == Tab::Calendar {
+            let _ = self.calendar_tx.send(calendar::Command::Refresh);
+        }
         self.note_viewing(next);
         if next == Mode::Rest {
             self.selected = None;
             self.selected_run = None;
             self.runs_scroll = 0;
+            self.page_scroll = 0;
+            self.pressed = None;
         }
         let to = if next == Mode::Open { layout::open_shape(self.open_width()) } else { layout::shape_for(next) };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
@@ -318,13 +361,127 @@ impl App {
         }
     }
 
-    /// The wheel scrolls a long list of finished runs, and otherwise moves between tabs.
+    fn begin_edit(&mut self, target: Option<u64>) {
+        let text = target.and_then(|id| self.todos.iter().find(|t| t.id == id)).map_or(String::new(), |t| t.text.clone());
+        self.edit = Some(todos::Edit::new(target, &text));
+        self.high_surrogate = None;
+        let before = shell::take_focus(self.hwnd);
+        if before != self.hwnd {
+            self.focus_before = before;
+        }
+        self.dirty = true;
+    }
+
+    /// Saves what was typed. Does nothing if no typing is going on.
+    fn commit_edit(&mut self) {
+        let Some(edit) = self.edit.take() else { return };
+        match edit.target {
+            Some(id) => todos::rewrite(&mut self.todos, id, &edit.text()),
+            None => todos::add(&mut self.todos, &edit.text()),
+        }
+        todos::save(&self.todos);
+        self.dirty = true;
+    }
+
+    fn give_focus_back(&mut self) {
+        shell::give_focus_back(self.focus_before);
+        self.focus_before = HWND::default();
+    }
+
+    fn key_down(&mut self, key: u32) {
+        let Some(edit) = self.edit.as_mut() else { return };
+        const VK_V: u32 = 0x56;
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        match key {
+            k if k == VK_LEFT.0 as u32 => edit.left(),
+            k if k == VK_RIGHT.0 as u32 => edit.right(),
+            k if k == VK_HOME.0 as u32 => edit.home(),
+            k if k == VK_END.0 as u32 => edit.end(),
+            k if k == VK_BACK.0 as u32 => edit.backspace(),
+            k if k == VK_DELETE.0 as u32 => edit.delete(),
+            k if k == VK_V && ctrl => {
+                if let Some(text) = shell::clipboard_text(self.hwnd) {
+                    edit.insert(&text);
+                }
+            }
+            k if k == VK_ESCAPE.0 as u32 => {
+                self.edit = None;
+                self.give_focus_back();
+                self.settle();
+            }
+            k if k == VK_RETURN.0 as u32 => {
+                let adding = edit.target.is_none() && !edit.chars.is_empty();
+                self.commit_edit();
+                if adding {
+                    // Enter again for the next one, or an empty Enter to finish.
+                    self.edit = Some(todos::Edit::default());
+                } else {
+                    self.give_focus_back();
+                    self.settle();
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn typed(&mut self, unit: u16) {
+        let Some(edit) = self.edit.as_mut() else { return };
+        let high = self.high_surrogate.take();
+        if (0xD800..0xDC00).contains(&unit) {
+            self.high_surrogate = Some(unit);
+            return;
+        }
+        let units = match high {
+            Some(first) => vec![first, unit],
+            None => vec![unit],
+        };
+        edit.insert(&String::from_utf16_lossy(&units));
+        self.dirty = true;
+    }
+
+    fn take_dropped_files(&mut self) {
+        let paths: Vec<String> = self.shelf_dropped.lock().map(|mut list| std::mem::take(&mut *list)).unwrap_or_default();
+        if shelf::add(&mut self.shelf, &paths) {
+            shelf::save(&self.shelf);
+        }
+        self.shelf_receiving = false;
+        // Stay open a moment so you can see them arrive.
+        self.hovering = true;
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_CLOSE, AFTER_DROP_MS, None);
+        }
+        self.settle();
+    }
+
+    fn drag_arrived(&mut self, arriving: bool) {
+        self.shelf_receiving = arriving;
+        if arriving && self.config.shelf {
+            self.config.tab = Tab::Shelf;
+        }
+        self.settle();
+    }
+
+    /// The wheel scrolls a page with more than fits, and otherwise moves between tabs.
     fn wheel(&mut self, down: bool) {
         let over_tabs = matches!(self.hovered, Some(Action::Tab(_)));
         let last = visible_runs(&self.runs, &self.config, agents::now_ms()).len().saturating_sub(view::RUN_ROWS);
         let on_runs = self.config.tab == Tab::Agents && self.selected.is_none() && self.selected_run.is_none() && !agents::any_live(&self.sessions);
         if !over_tabs && on_runs && last > 0 {
             self.runs_scroll = if down { (self.runs_scroll + 1).min(last) } else { self.runs_scroll.saturating_sub(1) };
+            self.hovered = None;
+            self.dirty = true;
+            return;
+        }
+        let now = agents::now_ms();
+        let last = match self.config.tab {
+            Tab::Todos => self.todos.len().saturating_sub(view::TODO_ROWS),
+            Tab::Shelf => self.shelf.len().saturating_sub(view::SHELF_COLUMNS),
+            Tab::Calendar if self.calendar.phase == calendar::Phase::Ready => self.calendar.events.iter().filter(|e| e.end_ms > now).count().saturating_sub(view::EVENT_ROWS),
+            _ => 0,
+        };
+        if !over_tabs && last > 0 {
+            self.page_scroll = if down { (self.page_scroll + 1).min(last) } else { self.page_scroll.saturating_sub(1) };
             self.hovered = None;
             self.dirty = true;
         } else {
@@ -345,7 +502,11 @@ impl App {
     fn choose_tab(&mut self, tab: Tab) {
         self.config.tab = tab;
         self.config.save();
+        self.page_scroll = 0;
         self.hovered = None;
+        if tab == Tab::Calendar {
+            let _ = self.calendar_tx.send(calendar::Command::Refresh);
+        }
         self.settle();
     }
 
@@ -401,6 +562,12 @@ impl App {
             runs: &runs,
             runs_scroll: self.runs_scroll,
             following: (self.config.track_claude, self.config.track_codex),
+            todos: &self.todos,
+            edit: self.edit.as_ref(),
+            shelf: &self.shelf,
+            shelf_receiving: self.shelf_receiving,
+            calendar: &self.calendar,
+            page_scroll: self.page_scroll,
             now_ms,
             pill: if self.config.agents { agents::pill_state(&self.sessions) } else { agents::Pill::Quiet },
             sessions: &self.sessions,
@@ -463,8 +630,28 @@ impl App {
         self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, a)| a.clone())
     }
 
-    fn mouse_move(&mut self, lparam: LPARAM) {
+    fn mouse_down(&mut self, lparam: LPARAM) {
+        let (x, y) = self.to_canvas(lparam);
+        self.pressed = match self.hit_at(x, y) {
+            Some(Action::ShelfOpen(path)) => Some((path, x, y)),
+            _ => None,
+        };
+    }
+
+    fn mouse_move(&mut self, wparam: WPARAM, lparam: LPARAM) {
         let hwnd = self.hwnd;
+        if let Some((path, from_x, from_y)) = self.pressed.clone() {
+            let (x, y) = self.to_canvas(lparam);
+            let button_down = wparam.0 & 1 != 0;
+            if !button_down {
+                self.pressed = None;
+            } else if (x - from_x).abs().max((y - from_y).abs()) > DRAG_START_PX {
+                self.pressed = None;
+                shelf::drag_out(&path);
+                self.hovered = None;
+                return;
+            }
+        }
         if !self.tracking {
             let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             unsafe {
@@ -501,7 +688,15 @@ impl App {
 
     fn click(&mut self, lparam: LPARAM) {
         let (x, y) = self.to_canvas(lparam);
-        match self.hit_at(x, y) {
+        let hit = self.hit_at(x, y);
+        let was_pressed = self.pressed.take().is_some();
+        if self.edit.is_some() && !matches!(hit, Some(Action::TodoField)) {
+            self.commit_edit();
+            if !matches!(hit, Some(Action::TodoNew | Action::TodoEdit(_))) {
+                self.give_focus_back();
+            }
+        }
+        match hit {
             Some(Action::Previous) => drop(self.media_tx.send(Command::Previous)),
             Some(Action::Toggle) => drop(self.media_tx.send(Command::Toggle)),
             Some(Action::Next) => drop(self.media_tx.send(Command::Next)),
@@ -523,6 +718,39 @@ impl App {
                 self.hovered = None;
                 self.settle();
             }
+            Some(Action::TodoNew) => self.begin_edit(None),
+            Some(Action::TodoField) => {}
+            Some(Action::TodoEdit(id)) => self.begin_edit(Some(id)),
+            Some(Action::TodoToggle(id)) => {
+                todos::toggle(&mut self.todos, id);
+                todos::save(&self.todos);
+            }
+            Some(Action::TodoDelete(id)) => {
+                todos::delete(&mut self.todos, id);
+                todos::save(&self.todos);
+                self.hovered = None;
+            }
+            Some(Action::ShelfOpen(path)) => {
+                if was_pressed {
+                    shell::open(&path);
+                }
+            }
+            Some(Action::ShelfRemove(path)) => {
+                self.shelf.retain(|item| item.path != path);
+                shelf::save(&self.shelf);
+                self.hovered = None;
+            }
+            Some(Action::ShelfClear) => {
+                self.shelf.clear();
+                shelf::save(&self.shelf);
+                self.hovered = None;
+            }
+            Some(Action::CalendarConnect) => drop(self.calendar_tx.send(calendar::Command::Connect)),
+            Some(Action::OpenUrl(url)) => shell::open(&url),
+            Some(Action::OpenFolder) => {
+                let _ = std::fs::create_dir_all(config::dir());
+                shell::open(&config::dir().to_string_lossy());
+            }
             Some(Action::Jump(agent, id)) => self.jump(agent, &id),
             Some(Action::JumpRun(at_ms)) => self.jump_to_run(at_ms),
             Some(Action::Back) => {
@@ -540,6 +768,7 @@ impl App {
             }
             None => {}
         }
+        self.dirty = true;
     }
 
     fn answer(&mut self, agent: Agent, id: &str, allow: bool) {
@@ -634,7 +863,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_STATE => app.pull_state(),
         WM_FOREGROUND => app.check_fullscreen(),
         WM_TIMER => app.timer(wparam.0),
-        WM_MOUSEMOVE => app.mouse_move(lparam),
+        WM_MOUSEMOVE => app.mouse_move(wparam, lparam),
+        WM_LBUTTONDOWN => app.mouse_down(lparam),
+        WM_KEYDOWN => app.key_down(wparam.0 as u32),
+        WM_CHAR => app.typed(wparam.0 as u16),
+        WM_KILLFOCUS => {
+            // Clicking anywhere else saves what you typed.
+            if app.edit.is_some() {
+                app.commit_edit();
+                app.focus_before = HWND::default();
+                app.settle();
+            }
+        }
+        shelf::WM_DRAG => app.drag_arrived(wparam.0 == 1),
+        shelf::WM_DROPPED => app.take_dropped_files(),
         WM_MOUSELEAVE => app.mouse_leave(),
         WM_LBUTTONUP => app.click(lparam),
         WM_WHEEL => app.wheel(((wparam.0 >> 16) as u16 as i16) < 0),
@@ -674,7 +916,7 @@ fn main() {
         if single.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        let _ = OleInitialize(None); // the apartment COM needs, plus drag and drop
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let instance = GetModuleHandleW(PCWSTR::null()).expect("own module");
@@ -698,6 +940,10 @@ fn main() {
         let media_tx = media::start(media_state.clone(), tell_window);
         let lyrics_store = Arc::new(Mutex::new(lyrics::Store::default()));
         let lyrics_tx = lyrics::start(lyrics_store.clone(), tell_window);
+        let calendar_state = Arc::new(Mutex::new(calendar::State::default()));
+        let calendar_tx = calendar::start(calendar_state.clone(), tell_window);
+        let shelf_dropped = Arc::new(Mutex::new(vec![]));
+        shelf::accept_drops(hwnd, shelf_dropped.clone());
 
         let start = layout::shape_for(Mode::Rest);
         let app = Box::into_raw(Box::new(App {
@@ -735,6 +981,18 @@ fn main() {
             runs,
             selected_run: None,
             runs_scroll: 0,
+            page_scroll: 0,
+            todos: todos::load(),
+            edit: None,
+            focus_before: HWND::default(),
+            high_surrogate: None,
+            shelf: shelf::load(),
+            shelf_dropped,
+            shelf_receiving: false,
+            pressed: None,
+            calendar_state,
+            calendar: calendar::State::default(),
+            calendar_tx,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

@@ -1,9 +1,12 @@
 //! What the notch shows in each state, and which parts of it you can click.
 use crate::agents::{self, Agent, Pill, PlanState, Run, SessionView, Status};
+use crate::calendar::{self, Phase};
 use crate::gfx::{Align, Gfx, Rect};
 use crate::layout::{self, Mode, Shape, Tab, CANVAS_W};
 use crate::lyrics::{self, Line};
 use crate::media::Media;
+use crate::shelf;
+use crate::todos::{Edit, Todo};
 
 const WHITE: u32 = 0xFFFFFF;
 const MUTED: u32 = 0xA3A7AD;
@@ -17,6 +20,9 @@ const CODEX: u32 = 0x7DD3C0;
 const PAD: f32 = 16.0;
 const MUSIC_W: f32 = 250.0;
 pub const RUN_ROWS: usize = 3;
+pub const TODO_ROWS: usize = 3;
+pub const EVENT_ROWS: usize = 3;
+pub const SHELF_COLUMNS: usize = 4;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Action {
@@ -34,6 +40,17 @@ pub enum Action {
     Jump(Agent, String),
     OpenRun(u64),
     JumpRun(u64),
+    TodoNew,
+    TodoField,
+    TodoToggle(u64),
+    TodoEdit(u64),
+    TodoDelete(u64),
+    ShelfOpen(String),
+    ShelfRemove(String),
+    ShelfClear,
+    CalendarConnect,
+    OpenUrl(String),
+    OpenFolder,
 }
 
 pub struct Scene<'a> {
@@ -52,6 +69,12 @@ pub struct Scene<'a> {
     pub selected_run: Option<&'a Run>,
     pub runs_scroll: usize,
     pub following: (bool, bool),
+    pub todos: &'a [Todo],
+    pub edit: Option<&'a Edit>,
+    pub shelf: &'a [shelf::Item],
+    pub shelf_receiving: bool,
+    pub calendar: &'a calendar::State,
+    pub page_scroll: usize,
     pub now_ms: u64,
     pub peek: Option<&'a str>,
     pub peek_status: Status,
@@ -106,6 +129,9 @@ fn draw_open(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
     match s.tab {
         Tab::Media => draw_music(g, s, a, alpha, hits),
         Tab::Agents => draw_agents(g, s, a, alpha, hits),
+        Tab::Calendar => draw_calendar(g, s, a, alpha, hits),
+        Tab::Todos => draw_todos(g, s, a, alpha, hits),
+        Tab::Shelf => draw_shelf(g, s, a, alpha, hits),
     }
     if s.tabs.len() > 1 {
         draw_dots(g, s, a, alpha, hits);
@@ -171,6 +197,27 @@ fn draw_tab_icon(g: &mut Gfx, tab: Tab, cx: f32, cy: f32, alpha: f32) {
             g.fill(Rect { x: cx + 7.4, y: cy - 2.0, w: 1.6, h: 5.0 }, 0.8, WHITE, alpha);
             g.circle(cx - 3.0, cy, 1.7, 0x000000, alpha);
             g.circle(cx + 3.0, cy, 1.7, 0x000000, alpha);
+        }
+        Tab::Calendar => {
+            g.fill(Rect { x: cx - 7.0, y: cy - 6.0, w: 14.0, h: 13.0 }, 2.5, WHITE, alpha);
+            g.fill(Rect { x: cx - 5.5, y: cy - 2.0, w: 11.0, h: 7.5 }, 1.0, 0x000000, alpha);
+            g.fill(Rect { x: cx - 4.0, y: cy - 8.0, w: 1.8, h: 3.5 }, 0.8, WHITE, alpha);
+            g.fill(Rect { x: cx + 2.2, y: cy - 8.0, w: 1.8, h: 3.5 }, 0.8, WHITE, alpha);
+            g.fill(Rect { x: cx - 3.5, y: cy, w: 3.0, h: 3.0 }, 0.5, WHITE, alpha);
+        }
+        Tab::Todos => {
+            for (row, wide) in [(-5.0, 9.0), (0.0, 7.0), (5.0, 9.0)] {
+                g.circle(cx - 6.0, cy + row, 1.5, WHITE, alpha);
+                g.fill(Rect { x: cx - 2.5, y: cy + row - 0.9, w: wide, h: 1.8 }, 0.9, WHITE, alpha);
+            }
+        }
+        Tab::Shelf => {
+            // A tray with an arrow dropping into it.
+            g.fill(Rect { x: cx - 8.0, y: cy + 1.0, w: 2.0, h: 6.5 }, 1.0, WHITE, alpha);
+            g.fill(Rect { x: cx + 6.0, y: cy + 1.0, w: 2.0, h: 6.5 }, 1.0, WHITE, alpha);
+            g.fill(Rect { x: cx - 8.0, y: cy + 5.5, w: 16.0, h: 2.0 }, 1.0, WHITE, alpha);
+            g.fill(Rect { x: cx - 1.0, y: cy - 8.0, w: 2.0, h: 8.0 }, 0.5, WHITE, alpha);
+            g.polygon(&[(cx - 4.0, cy - 2.0), (cx + 4.0, cy - 2.0), (cx, cy + 3.0)], WHITE, alpha);
         }
     }
 }
@@ -446,6 +493,191 @@ fn draw_small_row(g: &mut Gfx, s: &Scene, v: &SessionView, r: Rect, alpha: f32, 
     g.text(&v.project, Rect { x: r.x + 66.0, y: r.y, w: r.w - 66.0 - 122.0, h: r.h }, 11.0, false, Align::Left, WHITE, alpha);
     g.text(&v.status_text(), Rect { x: r.x + r.w - 118.0, y: r.y, w: 108.0, h: r.h }, 10.5, true, Align::Right, state_colour(v), alpha);
     hits.push((r, action));
+}
+
+/// A page's resting state: icon tile, a headline and a line under it, as on the player.
+fn draw_page_header(g: &mut Gfx, tab: Tab, title: &str, line: &str, a: Rect, alpha: f32) {
+    let x = a.x + PAD + 4.0;
+    let tile = Rect { x, y: 10.0, w: 54.0, h: 54.0 };
+    g.fill(tile, 10.0, WHITE, 0.08 * alpha);
+    draw_tab_icon(g, tab, tile.x + 27.0, tile.y + 28.0, 0.45 * alpha);
+    let tx = tile.x + tile.w + 12.0;
+    let tw = a.x + a.w - PAD - 4.0 - tx;
+    g.text(title, Rect { x: tx, y: 16.0, w: tw, h: 22.0 }, 14.5, true, Align::Left, WHITE, alpha);
+    g.text(line, Rect { x: tx, y: 38.0, w: tw, h: 18.0 }, 12.0, false, Align::Left, MUTED, alpha);
+}
+
+fn draw_pill_button(g: &mut Gfx, s: &Scene, label: &str, r: Rect, action: Action, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    g.fill(r, r.h / 2.0, WHITE, if is_hovered(s, &action) { 0.24 } else { 0.12 } * alpha);
+    g.text(label, r, 11.5, true, Align::Center, WHITE, alpha);
+    hits.push((r, action));
+}
+
+/// One line being typed. Long text slides left so the caret stays visible.
+fn draw_field(g: &mut Gfx, edit: &Edit, r: Rect, size: f32, alpha: f32) {
+    let caret = g.text_width(&edit.before_caret(), size, false);
+    let shift = (caret - (r.w - 4.0)).max(0.0);
+    g.clip(r);
+    g.text(&edit.text(), Rect { x: r.x - shift, y: r.y, w: 10_000.0, h: r.h }, size, false, Align::Left, WHITE, alpha);
+    g.fill(Rect { x: r.x + caret - shift, y: r.y + 3.0, w: 1.3, h: r.h - 6.0 }, 0.0, WHITE, alpha);
+    g.unclip();
+}
+
+fn draw_todos(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let (x, w) = (a.x + PAD, a.w - PAD * 2.0);
+    let input = Rect { x, y: 8.0, w, h: 26.0 };
+    let typing_new = s.edit.filter(|e| e.target.is_none());
+    g.fill(input, 13.0, WHITE, if typing_new.is_some() { 0.14 } else { 0.08 } * alpha);
+    let inner = Rect { x: x + 12.0, y: input.y, w: w - 24.0, h: input.h };
+    match typing_new {
+        Some(edit) => {
+            draw_field(g, edit, inner, 12.0, alpha);
+            hits.push((input, Action::TodoField));
+        }
+        None => {
+            g.text("+  Add a todo", inner, 12.0, false, Align::Left, if is_hovered(s, &Action::TodoNew) { WHITE } else { MUTED }, alpha);
+            hits.push((input, Action::TodoNew));
+        }
+    }
+    if s.todos.is_empty() {
+        g.text("Nothing to do", Rect { x, y: 44.0, w, h: 60.0 }, 12.5, false, Align::Center, FAINT, alpha);
+        return;
+    }
+    let row_h = 25.0;
+    let scroll = s.page_scroll.min(s.todos.len().saturating_sub(TODO_ROWS));
+    for (i, todo) in s.todos.iter().enumerate().skip(scroll).take(TODO_ROWS) {
+        let r = Rect { x, y: 38.0 + (i - scroll) as f32 * row_h, w, h: row_h };
+        let (toggle, change, delete) = (Action::TodoToggle(todo.id), Action::TodoEdit(todo.id), Action::TodoDelete(todo.id));
+        let over = is_hovered(s, &toggle) || is_hovered(s, &change) || is_hovered(s, &delete);
+        if over {
+            g.fill(r, 8.0, WHITE, 0.06 * alpha);
+        }
+        let (cx, cy) = (r.x + 13.0, r.y + r.h / 2.0);
+        if todo.done {
+            g.circle(cx, cy, 6.5, GREEN, alpha);
+            g.polygon(&[(cx - 3.4, cy - 0.2), (cx - 2.2, cy - 1.4), (cx - 0.8, cy + 0.2), (cx + 2.4, cy - 3.0), (cx + 3.6, cy - 1.8), (cx - 0.8, cy + 2.6)], 0x052E16, alpha);
+        } else {
+            g.circle(cx, cy, 6.5, if is_hovered(s, &toggle) { WHITE } else { MUTED }, alpha);
+            g.circle(cx, cy, 5.2, 0x000000, alpha);
+        }
+        let text_r = Rect { x: r.x + 26.0, y: r.y, w: r.w - 26.0 - 24.0, h: r.h };
+        if let Some(edit) = s.edit.filter(|e| e.target == Some(todo.id)) {
+            g.fill(Rect { x: text_r.x - 5.0, y: r.y + 2.0, w: text_r.w + 10.0, h: r.h - 4.0 }, 6.0, WHITE, 0.14 * alpha);
+            draw_field(g, edit, text_r, 12.0, alpha);
+            hits.push((text_r, Action::TodoField));
+        } else {
+            g.text(&todo.text, text_r, 12.0, false, Align::Left, if todo.done { FAINT } else { WHITE }, alpha);
+            if todo.done {
+                let line = g.text_width(&todo.text, 12.0, false).min(text_r.w);
+                g.fill(Rect { x: text_r.x, y: cy, w: line, h: 1.0 }, 0.0, FAINT, alpha);
+            }
+            hits.push((text_r, change));
+        }
+        hits.push((Rect { x: r.x, y: r.y, w: 26.0, h: r.h }, toggle));
+        let del = Rect { x: r.x + r.w - 24.0, y: r.y, w: 24.0, h: r.h };
+        if over {
+            g.text("×", del, 15.0, false, Align::Center, if is_hovered(s, &delete) { RED } else { MUTED }, alpha);
+        }
+        hits.push((del, delete));
+    }
+    if s.todos.len() > TODO_ROWS {
+        let track = row_h * TODO_ROWS as f32 - 6.0;
+        let y = 41.0 + track * scroll as f32 / s.todos.len() as f32;
+        g.fill(Rect { x: a.x + a.w - 7.0, y, w: 2.5, h: track * TODO_ROWS as f32 / s.todos.len() as f32 }, 1.2, WHITE, 0.35 * alpha);
+    }
+}
+
+fn draw_shelf(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    if s.shelf_receiving {
+        let zone = Rect { x: a.x + PAD, y: 10.0, w: a.w - PAD * 2.0, h: 100.0 };
+        g.fill(zone, 14.0, BLUE, 0.18 * alpha);
+        g.text("Drop to add to the shelf", zone, 13.5, true, Align::Center, WHITE, alpha);
+        return;
+    }
+    if s.shelf.is_empty() {
+        draw_page_header(g, Tab::Shelf, "Shelf is empty", "Drag files onto the pill", a, alpha);
+        g.text("Files stay where they are. The shelf only remembers them.", Rect { x: a.x + PAD + 4.0, y: 76.0, w: a.w - (PAD + 4.0) * 2.0, h: 28.0 }, 10.5, false, Align::Left, FAINT, alpha);
+        return;
+    }
+    let cell = (a.w - PAD * 2.0) / SHELF_COLUMNS as f32;
+    let scroll = s.page_scroll.min(s.shelf.len().saturating_sub(SHELF_COLUMNS));
+    for (i, item) in s.shelf.iter().enumerate().skip(scroll).take(SHELF_COLUMNS) {
+        let r = Rect { x: a.x + PAD + (i - scroll) as f32 * cell, y: 8.0, w: cell, h: 78.0 };
+        let (open, remove) = (Action::ShelfOpen(item.path.clone()), Action::ShelfRemove(item.path.clone()));
+        let over = is_hovered(s, &open) || is_hovered(s, &remove);
+        if over {
+            g.fill(r, 10.0, WHITE, 0.07 * alpha);
+        }
+        let tile = Rect { x: r.x + (r.w - 42.0) / 2.0, y: r.y + 7.0, w: 42.0, h: 44.0 };
+        g.fill(tile, 8.0, WHITE, 0.12 * alpha);
+        g.text(&item.badge, tile, 10.5, true, Align::Center, WHITE, alpha);
+        g.text(&item.name, Rect { x: r.x + 4.0, y: r.y + 54.0, w: r.w - 8.0, h: 20.0 }, 10.5, false, Align::Center, MUTED, alpha);
+        hits.push((r, open));
+        let close = Rect { x: r.x + r.w - 20.0, y: r.y + 2.0, w: 18.0, h: 18.0 };
+        if over {
+            g.circle(close.x + 9.0, close.y + 9.0, 8.0, 0x2C2C2E, alpha);
+            g.text("×", close, 13.0, false, Align::Center, if is_hovered(s, &remove) { RED } else { WHITE }, alpha);
+        }
+        hits.push((close, remove));
+    }
+    let count = if s.shelf.len() == 1 { "1 item".to_string() } else { format!("{} items", s.shelf.len()) };
+    g.text(&count, Rect { x: a.x + PAD + 4.0, y: 92.0, w: 120.0, h: 20.0 }, 10.5, false, Align::Left, FAINT, alpha);
+    draw_pill_button(g, s, "Clear", Rect { x: a.x + a.w - PAD - 52.0, y: 92.0, w: 52.0, h: 20.0 }, Action::ShelfClear, alpha, hits);
+}
+
+fn draw_calendar(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let (x, w) = (a.x + PAD + 4.0, a.w - (PAD + 4.0) * 2.0);
+    let wide = Rect { x, y: 76.0, w, h: 28.0 };
+    match &s.calendar.phase {
+        Phase::NeedsSetup => {
+            draw_page_header(g, Tab::Calendar, "Connect Google Calendar", "Add your Google client file first", a, alpha);
+            let half = (w - 8.0) / 2.0;
+            draw_pill_button(g, s, "Google setup", Rect { w: half, ..wide }, Action::OpenUrl(calendar::CONSOLE_URL.to_string()), alpha, hits);
+            draw_pill_button(g, s, "Open folder", Rect { x: x + half + 8.0, w: half, ..wide }, Action::OpenFolder, alpha, hits);
+        }
+        Phase::SignedOut(why) => {
+            let line = if why.is_empty() { "Read-only: TwoCode can't change events" } else { why.as_str() };
+            draw_page_header(g, Tab::Calendar, "Connect Google Calendar", line, a, alpha);
+            draw_pill_button(g, s, "Connect", wide, Action::CalendarConnect, alpha, hits);
+        }
+        Phase::Connecting => {
+            draw_page_header(g, Tab::Calendar, "Waiting for your browser", "Finish signing in with Google", a, alpha);
+        }
+        Phase::Failed(why) => {
+            draw_page_header(g, Tab::Calendar, "Couldn't load your calendar", why, a, alpha);
+            draw_pill_button(g, s, "Try again", wide, Action::CalendarConnect, alpha, hits);
+        }
+        Phase::Ready => draw_events(g, s, a, alpha, hits),
+    }
+}
+
+fn draw_events(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    let upcoming: Vec<&calendar::Event> = s.calendar.events.iter().filter(|e| e.end_ms > s.now_ms).collect();
+    if upcoming.is_empty() {
+        draw_page_header(g, Tab::Calendar, "Nothing coming up", "Your next 7 days are clear", a, alpha);
+        return;
+    }
+    let (x, w, row_h) = (a.x + 10.0, a.w - 20.0, 37.0);
+    let scroll = s.page_scroll.min(upcoming.len().saturating_sub(EVENT_ROWS));
+    let top = 7.0 + (EVENT_ROWS - upcoming.len().min(EVENT_ROWS)) as f32 * row_h / 2.0;
+    for (i, event) in upcoming.iter().enumerate().skip(scroll).take(EVENT_ROWS) {
+        let r = Rect { x, y: top + (i - scroll) as f32 * row_h, w, h: row_h - 2.0 };
+        let open = Action::OpenUrl(event.link.clone());
+        if !event.link.is_empty() {
+            if is_hovered(s, &open) {
+                g.fill(r, 10.0, WHITE, 0.08 * alpha);
+            }
+            hits.push((r, open));
+        }
+        let live = !event.all_day && event.start_ms <= s.now_ms;
+        g.fill(Rect { x: r.x + 8.0, y: r.y + 5.0, w: 3.0, h: r.h - 10.0 }, 1.5, if live { GREEN } else { BLUE }, alpha);
+        let room = r.w - 20.0 - if event.join.is_some() { 56.0 } else { 8.0 };
+        g.text(&event.title, Rect { x: r.x + 18.0, y: r.y + 1.0, w: room, h: 18.0 }, 12.0, true, Align::Left, WHITE, alpha);
+        g.text(&calendar::when(event, s.now_ms), Rect { x: r.x + 18.0, y: r.y + 17.0, w: room, h: 16.0 }, 10.5, false, Align::Left, if live { GREEN } else { MUTED }, alpha);
+        if let Some(join) = &event.join {
+            draw_pill_button(g, s, "Join", Rect { x: r.x + r.w - 52.0, y: r.y + 7.0, w: 44.0, h: 21.0 }, Action::OpenUrl(join.clone()), alpha, hits);
+        }
+    }
 }
 
 /// One session up close: what it needs from you, or what it is doing right now.

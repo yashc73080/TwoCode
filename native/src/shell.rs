@@ -6,8 +6,10 @@ use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, SetFocus, KEYEVENTF_KEYUP, VK_MENU};
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -69,6 +71,10 @@ const ID_LYRICS: usize = 11;
 const ID_ALLOW_CODEX: usize = 12;
 const ID_SOUNDS: usize = 13;
 const ID_RECENT: usize = 14;
+const ID_CALENDAR: usize = 15;
+const ID_TODOS: usize = 16;
+const ID_SHELF: usize = 17;
+const ID_DISCONNECT: usize = 18;
 const ID_DISPLAY_FIRST: usize = 100;
 
 pub fn show_menu(app: &mut App) {
@@ -76,7 +82,7 @@ pub fn show_menu(app: &mut App) {
     let allow_codex_on = hooks::codex_installed(&app.secret);
     let displays = monitors();
     let c = app.config.clone();
-    let items: [(usize, &str, bool, bool); 12] = [
+    let items: [(usize, &str, bool, bool); 16] = [
         (ID_MEDIA, "Media player", c.media, true),
         (ID_LYRICS, "    Lyrics (from LRCLIB)", c.lyrics, c.media),
         (ID_AGENTS, "Agent tracker", c.agents, true),
@@ -86,6 +92,10 @@ pub fn show_menu(app: &mut App) {
         (ID_RECENT, "    Show recent runs", c.recent, c.agents),
         (ID_ALLOW, "    Allow or Deny from the notch (Claude Code)", allow_on, c.agents),
         (ID_ALLOW_CODEX, "    Allow or Deny from the notch (Codex)", allow_codex_on, c.agents),
+        (ID_CALENDAR, "Calendar", c.calendar, true),
+        (ID_DISCONNECT, "    Disconnect Google Calendar", false, crate::calendar::connected()),
+        (ID_TODOS, "Todos", c.todos, true),
+        (ID_SHELF, "Shelf", c.shelf, true),
         (ID_SOUNDS, "Sounds", c.sounds, true),
         (ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true),
         (ID_STARTUP, "Start with Windows", starts_with_windows(), true),
@@ -102,7 +112,7 @@ pub fn show_menu(app: &mut App) {
                 flags |= MF_GRAYED;
             }
             let _ = AppendMenuW(menu, flags, *id, PCWSTR(wide.as_ptr()));
-            if i == 9 {
+            if i == 13 {
                 if let Ok(sub) = CreatePopupMenu() {
                     let chosen = displays.iter().position(|d| d.name == c.display).or_else(|| displays.iter().position(|d| d.primary));
                     for (n, d) in displays.iter().enumerate() {
@@ -114,7 +124,7 @@ pub fn show_menu(app: &mut App) {
                     let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Show on"));
                 }
             }
-            if i == 8 || i == 11 {
+            if i == 8 || i == 12 || i == 15 {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
         }
@@ -150,6 +160,13 @@ fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {
         ID_FULLSCREEN => c.hide_fullscreen = !c.hide_fullscreen,
         ID_SOUNDS => c.sounds = !c.sounds,
         ID_RECENT => c.recent = !c.recent,
+        ID_CALENDAR => c.calendar = !c.calendar,
+        ID_TODOS => c.todos = !c.todos,
+        ID_SHELF => c.shelf = !c.shelf,
+        ID_DISCONNECT => {
+            let _ = app.calendar_tx.send(crate::calendar::Command::Disconnect);
+            return;
+        }
         ID_ALLOW_CODEX => {
             if let Err(why) = hooks::set_codex_installed(!allow_codex_on, &app.secret) {
                 show_error(&why);
@@ -266,6 +283,59 @@ pub fn display_rect(chosen: &str) -> RECT {
     let list = monitors();
     let pick = list.iter().find(|d| d.name == chosen).or_else(|| list.iter().find(|d| d.primary)).or(list.first());
     pick.map_or(RECT { left: 0, top: 0, right: unsafe { GetSystemMetrics(SM_CXSCREEN) }, bottom: 0 }, |d| d.rect)
+}
+
+/// Hands a web address, file or folder to whatever Windows opens it with.
+pub fn open(target: &str) {
+    let wide: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Makes the window able to receive typing, and returns what was in front so it can go back there.
+pub fn take_focus(hwnd: HWND) -> HWND {
+    unsafe {
+        let before = GetForegroundWindow();
+        if !SetForegroundWindow(hwnd).as_bool() || GetForegroundWindow() != hwnd {
+            // The same allowance as jumping to a session: the tap of Alt counts as the user's request.
+            keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        let _ = SetFocus(Some(hwnd));
+        before
+    }
+}
+
+pub fn give_focus_back(to: HWND) {
+    unsafe {
+        if !to.is_invalid() {
+            let _ = SetForegroundWindow(to);
+        }
+    }
+}
+
+pub fn clipboard_text(hwnd: HWND) -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        OpenClipboard(Some(hwnd)).ok()?;
+        let mut text = None;
+        if let Ok(handle) = GetClipboardData(CF_UNICODETEXT) {
+            let memory = HGLOBAL(handle.0);
+            let start = GlobalLock(memory) as *const u16;
+            if !start.is_null() {
+                let mut length = 0;
+                while *start.add(length) != 0 {
+                    length += 1;
+                }
+                text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(start, length)));
+                let _ = GlobalUnlock(memory);
+            }
+        }
+        let _ = CloseClipboard();
+        text
+    }
 }
 
 // ---- sounds ----

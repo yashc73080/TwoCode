@@ -8,6 +8,7 @@ const DURATION_MS: f32 = 240.0;
 const MEDIA_W: f32 = 320.0;
 const MEDIA_LYRICS_W: f32 = 540.0;
 const AGENTS_W: f32 = 440.0;
+const CALENDAR_W: f32 = 380.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -33,6 +34,9 @@ pub enum Tab {
     // Settings saved before Recent joined the agents page still load.
     #[serde(alias = "Recent")]
     Agents,
+    Calendar,
+    Todos,
+    Shelf,
 }
 
 impl Tab {
@@ -40,19 +44,15 @@ impl Tab {
         match self {
             Tab::Media => "Media",
             Tab::Agents => "Agents",
+            Tab::Calendar => "Calendar",
+            Tab::Todos => "Todos",
+            Tab::Shelf => "Shelf",
         }
     }
 }
 
-pub fn tabs(media: bool, agents: bool) -> Vec<Tab> {
-    let mut list = vec![];
-    if media {
-        list.push(Tab::Media);
-    }
-    if agents {
-        list.push(Tab::Agents);
-    }
-    list
+pub fn tabs(media: bool, agents: bool, calendar: bool, todos: bool, shelf: bool) -> Vec<Tab> {
+    [(media, Tab::Media), (agents, Tab::Agents), (calendar, Tab::Calendar), (todos, Tab::Todos), (shelf, Tab::Shelf)].into_iter().filter(|(on, _)| *on).map(|(_, tab)| tab).collect()
 }
 
 pub fn shape_for(mode: Mode) -> Shape {
@@ -68,13 +68,15 @@ pub fn open_shape(w: f32) -> Shape {
 }
 
 /// How wide the open notch needs to be for what it is showing.
-pub fn open_width(tab: Tab, lyrics_showing: bool, no_agents: bool) -> f32 {
+pub fn open_width(tab: Tab, lyrics_showing: bool, nothing_listed: bool) -> f32 {
     match tab {
         Tab::Media if lyrics_showing => MEDIA_LYRICS_W,
         Tab::Media => MEDIA_W,
         // With nothing to list it stays the media page's size, so switching tabs moves nothing.
-        Tab::Agents if no_agents => MEDIA_W,
+        Tab::Agents | Tab::Calendar if nothing_listed => MEDIA_W,
         Tab::Agents => AGENTS_W,
+        Tab::Calendar => CALENDAR_W,
+        Tab::Todos | Tab::Shelf => MEDIA_W,
     }
 }
 
@@ -181,9 +183,9 @@ mod tests {
 
     #[test]
     fn tabs_follow_the_switches() {
-        assert_eq!(tabs(true, true), vec![Tab::Media, Tab::Agents]);
-        assert_eq!(tabs(false, true), vec![Tab::Agents]);
-        assert!(tabs(false, false).is_empty());
+        assert_eq!(tabs(true, true, true, true, true), vec![Tab::Media, Tab::Agents, Tab::Calendar, Tab::Todos, Tab::Shelf]);
+        assert_eq!(tabs(false, true, false, false, true), vec![Tab::Agents, Tab::Shelf]);
+        assert!(tabs(false, false, false, false, false).is_empty());
     }
 
     #[test]
