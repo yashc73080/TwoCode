@@ -1,6 +1,7 @@
 //! The Windows parts around the notch: tray icon, the switches menu, start with Windows, full-screen detection.
 use crate::agents::Agent;
 use crate::hooks;
+use crate::menu::Row;
 use crate::App;
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -77,75 +78,60 @@ const ID_SHELF: usize = 17;
 const ID_DISCONNECT: usize = 18;
 const ID_DISPLAY_FIRST: usize = 100;
 
-pub fn show_menu(app: &mut App) {
-    let allow_on = hooks::installed(&app.secret);
-    let allow_codex_on = hooks::codex_installed(&app.secret);
-    let displays = monitors();
-    let c = app.config.clone();
-    let items: [(usize, &str, bool, bool); 16] = [
-        (ID_MEDIA, "Media player", c.media, true),
-        (ID_LYRICS, "    Lyrics (from LRCLIB)", c.lyrics, c.media),
-        (ID_AGENTS, "Agent tracker", c.agents, true),
-        (ID_CLAUDE, "    Follow Claude Code", c.track_claude, c.agents),
-        (ID_CODEX, "    Follow Codex", c.track_codex, c.agents),
-        (ID_ALERTS, "    Pop up when an agent finishes", c.finish_popup, c.agents),
-        (ID_RECENT, "    Show recent runs", c.recent, c.agents),
-        (ID_ALLOW, "    Allow or Deny from the notch (Claude Code)", allow_on, c.agents),
-        (ID_ALLOW_CODEX, "    Allow or Deny from the notch (Codex)", allow_codex_on, c.agents),
-        (ID_CALENDAR, "Calendar", c.calendar, true),
-        (ID_DISCONNECT, "    Disconnect Google Calendar", false, crate::calendar::connected()),
-        (ID_TODOS, "Todos", c.todos, true),
-        (ID_SHELF, "Shelf", c.shelf, true),
-        (ID_SOUNDS, "Sounds", c.sounds, true),
-        (ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true),
-        (ID_STARTUP, "Start with Windows", starts_with_windows(), true),
+/// What the settings panel shows right now.
+pub fn menu_rows(app: &App) -> Vec<Row> {
+    let c = &app.config;
+    let switch = |id, label: &str, on, enabled, child| Row::Switch { id, label: label.to_string(), on, enabled, child };
+    let mut rows = vec![
+        Row::Header("Media"),
+        switch(ID_MEDIA, "Media player", c.media, true, false),
+        switch(ID_LYRICS, "Lyrics", c.lyrics, c.media, true),
+        Row::Header("Agents"),
+        switch(ID_AGENTS, "Agent tracker", c.agents, true, false),
+        switch(ID_CLAUDE, "Follow Claude Code", c.track_claude, c.agents, true),
+        switch(ID_CODEX, "Follow Codex", c.track_codex, c.agents, true),
+        switch(ID_ALERTS, "Pop up when an agent finishes", c.finish_popup, c.agents, true),
+        switch(ID_RECENT, "Show recent runs", c.recent, c.agents, true),
+        switch(ID_ALLOW, "Allow or Deny for Claude Code", hooks::installed(&app.secret), c.agents, true),
+        switch(ID_ALLOW_CODEX, "Allow or Deny for Codex", hooks::codex_installed(&app.secret), c.agents, true),
+        Row::Header("Tabs"),
+        switch(ID_CALENDAR, "Calendar", c.calendar, true, false),
     ];
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        for (i, (id, label, checked, enabled)) in items.iter().enumerate() {
-            let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-            let mut flags = MF_STRING;
-            if *checked {
-                flags |= MF_CHECKED;
-            }
-            if !*enabled {
-                flags |= MF_GRAYED;
-            }
-            let _ = AppendMenuW(menu, flags, *id, PCWSTR(wide.as_ptr()));
-            if i == 13 {
-                if let Ok(sub) = CreatePopupMenu() {
-                    let chosen = displays.iter().position(|d| d.name == c.display).or_else(|| displays.iter().position(|d| d.primary));
-                    for (n, d) in displays.iter().enumerate() {
-                        let name = format!("Display {} ({} x {}){}", n + 1, d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, if d.primary { ", main" } else { "" });
-                        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-                        let flags = if chosen == Some(n) { MF_STRING | MF_CHECKED } else { MF_STRING };
-                        let _ = AppendMenuW(sub, flags, ID_DISPLAY_FIRST + n, PCWSTR(wide.as_ptr()));
-                    }
-                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Show on"));
-                }
-            }
-            if i == 8 || i == 12 || i == 15 {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            }
-        }
-        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit TwoCode"));
-        let mut at = POINT::default();
-        let _ = GetCursorPos(&mut at);
-        let hwnd = HWND(crate::WINDOW.load(std::sync::atomic::Ordering::SeqCst) as *mut _);
-        let _ = SetForegroundWindow(hwnd); // otherwise the menu does not close when you click elsewhere
-        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, at.x, at.y, None, hwnd, None);
-        let _ = DestroyMenu(menu);
-        let chosen = chosen.0 as usize;
-        if chosen >= ID_DISPLAY_FIRST {
-            if let Some(d) = displays.get(chosen - ID_DISPLAY_FIRST) {
-                app.config.display = d.name.clone();
-                app.config.save();
-                app.recreate_graphics();
-            }
-            return;
-        }
-        choose(app, chosen, allow_on, allow_codex_on);
+    if crate::calendar::connected() {
+        rows.push(Row::Button { id: ID_DISCONNECT, label: "Disconnect Google Calendar".to_string(), enabled: true, danger: false });
     }
+    rows.push(switch(ID_TODOS, "Todos", c.todos, true, false));
+    rows.push(switch(ID_SHELF, "Shelf", c.shelf, true, false));
+    let displays = monitors();
+    if displays.len() > 1 {
+        rows.push(Row::Header("Show on"));
+        let chosen = displays.iter().position(|d| d.name == c.display).or_else(|| displays.iter().position(|d| d.primary));
+        for (n, d) in displays.iter().enumerate() {
+            let label = format!("Display {} ({} x {}){}", n + 1, d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, if d.primary { ", main" } else { "" });
+            rows.push(Row::Radio { id: ID_DISPLAY_FIRST + n, label, on: chosen == Some(n) });
+        }
+    }
+    rows.push(Row::Header("General"));
+    rows.push(switch(ID_SOUNDS, "Sounds", c.sounds, true, false));
+    rows.push(switch(ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true, false));
+    rows.push(switch(ID_STARTUP, "Start with Windows", starts_with_windows(), true, false));
+    rows.push(Row::Button { id: ID_EXIT, label: "Exit TwoCode".to_string(), enabled: true, danger: true });
+    rows
+}
+
+/// Does what a row says. Returns false if the panel should close afterward.
+pub fn menu_choose(app: &mut App, id: usize) -> bool {
+    if id >= ID_DISPLAY_FIRST {
+        if let Some(d) = monitors().get(id - ID_DISPLAY_FIRST) {
+            app.config.display = d.name.clone();
+            app.config.save();
+            app.recreate_graphics();
+        }
+        return false;
+    }
+    let (allow_on, allow_codex_on) = (hooks::installed(&app.secret), hooks::codex_installed(&app.secret));
+    choose(app, id, allow_on, allow_codex_on);
+    id != ID_EXIT && id != ID_DISCONNECT
 }
 
 fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {

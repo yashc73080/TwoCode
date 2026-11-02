@@ -76,7 +76,7 @@ pub fn lyric_shape(text_w: f32) -> Shape {
 }
 
 pub fn open_shape(w: f32) -> Shape {
-    Shape { w, h: 136.0, radius: 22.0, y: 0.0 }
+    Shape { w, h: 140.0, radius: 22.0, y: 0.0 }
 }
 
 /// How wide the open notch needs to be for what it is showing.

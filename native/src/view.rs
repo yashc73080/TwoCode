@@ -331,9 +331,29 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
     }
 }
 
+/// A speech bubble as one outline, tail included, so its parts never show as separate shapes.
+fn bubble_outline(x: f32, y: f32) -> Vec<(f32, f32)> {
+    const STEPS: usize = 6;
+    let (left, right, top, bottom, r) = (x - 8.5, x + 8.5, y - 7.0, y + 4.5, 4.0);
+    let mut points = vec![];
+    // Clockwise from the top left: each corner is an arc around its centre, starting at this angle.
+    for (cx, cy, start) in [(left + r, top + r, 180.0f32), (right - r, top + r, 270.0), (right - r, bottom - r, 0.0)] {
+        for step in 0..=STEPS {
+            let angle = (start + 90.0 * step as f32 / STEPS as f32).to_radians();
+            points.push((cx + r * angle.cos(), cy + r * angle.sin()));
+        }
+    }
+    // The bottom edge flows into the tail, which ends in a soft point.
+    points.extend([(x + 0.5, bottom), (x - 3.2, y + 7.9), (x - 4.2, y + 8.3), (x - 4.7, y + 7.5), (x - 4.2, bottom)]);
+    for step in 0..=STEPS {
+        let angle = (90.0 + 90.0 * step as f32 / STEPS as f32).to_radians();
+        points.push((left + r + r * angle.cos(), bottom - r + r * angle.sin()));
+    }
+    points
+}
+
 fn draw_bubble(g: &mut Gfx, x: f32, y: f32, alpha: f32) {
-    g.fill(Rect { x: x - 8.0, y: y - 6.5, w: 16.0, h: 11.0 }, 3.5, WHITE, alpha);
-    g.polygon(&[(x - 4.0, y + 3.5), (x + 1.0, y + 3.5), (x - 4.0, y + 8.0)], WHITE, alpha);
+    g.polygon(&bubble_outline(x, y), WHITE, alpha);
 }
 
 fn draw_transport(g: &mut Gfx, px: f32, cy: f32, action: &Action, playing: bool, alpha: f32) {

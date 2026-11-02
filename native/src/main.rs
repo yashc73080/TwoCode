@@ -9,6 +9,7 @@ mod hooks;
 mod layout;
 mod lyrics;
 mod media;
+mod menu;
 mod shelf;
 mod shell;
 mod todos;
@@ -120,6 +121,7 @@ pub struct App {
     listening: bool,
     lyric_strip: bool,
     opened_by_hover: bool,
+    menu: Option<HWND>,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -956,7 +958,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSELEAVE => app.mouse_leave(),
         WM_LBUTTONUP => app.click(lparam),
         WM_WHEEL => app.wheel(((wparam.0 >> 16) as u16 as i16) < 0),
-        WM_RBUTTONUP => shell::show_menu(app),
+        WM_RBUTTONUP => menu::open(app, true),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR => {
             let hand = app.hovered.is_some();
@@ -968,7 +970,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         shell::WM_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
-                shell::show_menu(app);
+                menu::open(app, false);
             }
         }
         WM_DESTROY => {
@@ -1077,6 +1079,7 @@ fn main() {
             listening: false,
             lyric_strip: false,
             opened_by_hover: false,
+            menu: None,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));
