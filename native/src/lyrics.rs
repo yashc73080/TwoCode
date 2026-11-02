@@ -9,6 +9,7 @@ use windows::Win32::Networking::WinHttp::*;
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const NEAR_ENOUGH_S: f64 = 5.0;
+const KEEP_SONGS: usize = 32;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Line {
@@ -42,6 +43,9 @@ pub fn start(store: Arc<Mutex<Store>>, on_change: impl Fn() + Send + 'static) ->
                 None => fetch(&request).map(Arc::new),
             };
             let Some(lines) = lines else { continue }; // offline: the next song tries again
+            if found.len() >= KEEP_SONGS {
+                found.clear();
+            }
             found.insert(request.key.clone(), lines.clone());
             if let Ok(mut store) = store.lock() {
                 *store = Store { key: request.key, lines };

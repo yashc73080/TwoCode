@@ -41,14 +41,18 @@ pub fn start(hub: Arc<Mutex<Hub>>, on_change: impl Fn() + Send + 'static) {
                 let _ = w.watch(root, RecursiveMode::Recursive);
             }
         }
-        let mut tails = HashMap::new();
+        let mut tails: HashMap<PathBuf, Tail> = HashMap::new();
         let mut first = true;
         let mut last_walk: Option<Instant> = None;
         let mut active: HashMap<PathBuf, (Agent, Instant)> = HashMap::new();
         let mut noticed: Vec<PathBuf> = vec![];
         loop {
             let mut changed = false;
-            let mut read = |agent: Agent, path: &Path, active: &mut HashMap<PathBuf, (Agent, Instant)>| {
+            let mut read = |agent: Agent, path: &Path, listed: Option<u64>, active: &mut HashMap<PathBuf, (Agent, Instant)>| {
+                // The folder listing already gives the size, so an unchanged file is never opened.
+                if listed.is_some_and(|len| tails.get(path).is_some_and(|t| t.offset == len)) {
+                    return;
+                }
                 if read_new(agent, path, &mut tails, &hub, first) {
                     changed = true;
                 }
@@ -60,8 +64,8 @@ pub fn start(hub: Arc<Mutex<Hub>>, on_change: impl Fn() + Send + 'static) {
                 for (agent, root) in &roots {
                     let mut files = vec![];
                     collect(root, &mut files, 0);
-                    for path in files {
-                        read(*agent, &path, &mut active);
+                    for (path, len) in files {
+                        read(*agent, &path, Some(len), &mut active);
                     }
                 }
                 last_walk = Some(Instant::now());
@@ -71,13 +75,13 @@ pub fn start(hub: Arc<Mutex<Hub>>, on_change: impl Fn() + Send + 'static) {
                     if let Some((agent, _)) = roots.iter().find(|(_, root)| path.starts_with(root)) {
                         let helper = path.components().any(|c| c.as_os_str() == "subagents");
                         if !helper && path.extension().is_some_and(|e| e == "jsonl") {
-                            read(*agent, &path, &mut active);
+                            read(*agent, &path, None, &mut active);
                         }
                     }
                 }
                 let recent: Vec<(PathBuf, Agent)> = active.iter().map(|(p, (a, _))| (p.clone(), *a)).collect();
                 for (path, agent) in recent {
-                    read(agent, &path, &mut active);
+                    read(agent, &path, None, &mut active);
                 }
             }
             active.retain(|_, (_, at)| at.elapsed() < ACTIVE_FOR);
@@ -99,7 +103,7 @@ pub fn start(hub: Arc<Mutex<Hub>>, on_change: impl Fn() + Send + 'static) {
     });
 }
 
-fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+fn collect(dir: &Path, out: &mut Vec<(PathBuf, u64)>, depth: u32) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -110,7 +114,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
                 collect(&path, out, depth + 1);
             }
         } else if path.extension().is_some_and(|e| e == "jsonl") {
-            out.push(path);
+            let len = entry.metadata().map_or(0, |m| m.len());
+            out.push((path, len));
         }
     }
 }

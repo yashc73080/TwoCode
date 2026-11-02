@@ -11,12 +11,12 @@ use windows::Win32::System::Com::*;
 pub const BARS: usize = 9;
 pub type Levels = [f32; BARS];
 const WINDOW: usize = 1024;
-const POLL: Duration = Duration::from_millis(16);
+const POLL: Duration = Duration::from_millis(33); // the bars are drawn this often, so listening faster is wasted
 const RETRY: Duration = Duration::from_secs(1);
 const LOWEST_HZ: f32 = 60.0;
 const HIGHEST_HZ: f32 = 12_000.0;
 const QUIETEST_DB: f32 = -60.0;
-const FALL: f32 = 0.84; // bars jump up with the sound and sink back slowly
+const FALL: f32 = 0.7; // bars jump up with the sound and sink back slowly
 const BUFFER_100NS: i64 = 1_000_000;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;

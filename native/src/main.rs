@@ -31,7 +31,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT};
@@ -48,6 +48,8 @@ const TIMER_FULLSCREEN: usize = 5;
 const TIMER_RETRY: usize = 6;
 const TIMER_WAVE: usize = 7;
 const TIMER_REMINDER: usize = 8;
+const TIMER_TRIM: usize = 9;
+const TRIM_AFTER_MS: u32 = 30_000;
 const REMINDER_CHECK_MS: u32 = 15_000;
 const WAVE_FRAME_MS: u32 = 33;
 const WM_WHEEL: u32 = 0x020A;
@@ -324,7 +326,7 @@ impl App {
         if next == Mode::Open && self.hovering {
             self.opened_by_hover = true;
         }
-        self.listen_to_audio(next == Mode::Open && self.config.tab == Tab::Media && self.config.media);
+        self.listen_to_audio(next == Mode::Open && self.config.tab == Tab::Media && self.config.media && !self.hidden_for_fullscreen);
         if next == Mode::Open && self.mode != Mode::Open && self.config.tab == Tab::Calendar {
             let _ = self.calendar_tx.send(calendar::Command::Refresh);
         }
@@ -342,13 +344,23 @@ impl App {
             _ => layout::shape_for(next),
         };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
+            unsafe {
+                if next == Mode::Open {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_TRIM);
+                } else if self.mode == Mode::Open {
+                    SetTimer(Some(self.hwnd), TIMER_TRIM, TRIM_AFTER_MS, None);
+                }
+            }
             self.mode = next;
             self.motion = Some(Motion { from: self.shape, to, elapsed_ms: 0.0 });
             self.last_frame = Instant::now();
         }
         self.ask_for_lyrics();
         unsafe {
-            if next == Mode::Open {
+            if self.hidden_for_fullscreen {
+                // Nothing on screen needs the time. Other threads still report what happens.
+                let _ = KillTimer(Some(self.hwnd), TIMER_TICK);
+            } else if next == Mode::Open {
                 // Quick enough for a lyric line to change on time; slower when nothing depends on it.
                 let singing = self.config.tab == Tab::Media && self.config.lyrics && self.media.playing && !self.lyric_lines.is_empty();
                 SetTimer(Some(self.hwnd), TIMER_TICK, if singing { 200 } else { 1000 }, None);
@@ -622,6 +634,14 @@ impl App {
     }
 
     fn render(&mut self) {
+        // Hidden behind a game or a film: draw nothing, and showing again draws the current state.
+        if self.hidden_for_fullscreen {
+            if let Some(motion) = self.motion.take() {
+                self.shape = motion.to;
+            }
+            self.dirty = false;
+            return;
+        }
         if let Some(motion) = self.motion.as_mut() {
             motion.elapsed_ms += self.last_frame.elapsed().as_secs_f32() * 1000.0;
             self.last_frame = Instant::now();
@@ -915,7 +935,7 @@ impl App {
                 let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
-        self.dirty = true;
+        self.settle();
     }
 
     fn timer(&mut self, id: usize) {
@@ -950,6 +970,14 @@ impl App {
                     self.dirty = true;
                 }
             }
+            // Startup and a closed notch leave pages that nothing touches until it opens again. Hand them back.
+            // Animating grows memory inside the graphics stack that only building it again returns.
+            TIMER_TRIM => unsafe {
+                if self.mode == Mode::Rest && self.motion.is_none() {
+                    self.recreate_graphics();
+                }
+                let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+            },
             TIMER_FULLSCREEN => self.check_fullscreen(),
             TIMER_RETRY => self.recreate_graphics(),
             _ => {}
@@ -1154,6 +1182,7 @@ fn main() {
         shell::add_tray(hwnd);
         SetTimer(Some(hwnd), TIMER_FULLSCREEN, 3000, None);
         SetTimer(Some(hwnd), TIMER_REMINDER, REMINDER_CHECK_MS, None);
+        SetTimer(Some(hwnd), TIMER_TRIM, TRIM_AFTER_MS, None);
         let _ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(foreground_changed), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         // Between animations this waits in GetMessage, so an idle notch uses no processor time.

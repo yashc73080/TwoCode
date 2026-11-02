@@ -55,7 +55,8 @@ pub struct Gfx {
     brush: ID2D1SolidColorBrush,
     dwrite: IDWriteFactory,
     formats: HashMap<(u32, bool, Align, bool), IDWriteTextFormat>,
-    art: Option<(u64, ID2D1BitmapBrush1)>,
+    art: Option<ID2D1BitmapBrush1>,
+    art_rev: Option<u64>,
     art_size: (f32, f32),
     art_colour: Option<u32>,
     pub scale: f32,
@@ -125,6 +126,7 @@ impl Gfx {
                 dwrite,
                 formats: HashMap::new(),
                 art: None,
+                art_rev: None,
                 art_size: (1.0, 1.0),
                 art_colour: None,
                 scale,
@@ -259,16 +261,16 @@ impl Gfx {
         Some(format)
     }
 
-    /// Decodes album art once per track; the encoded bytes are not kept.
+    /// Decodes album art once per track, and a cover that will not decode is not tried again.
     pub fn set_art(&mut self, rev: u64, bytes: Option<&[u8]>) {
-        if self.art.as_ref().is_some_and(|(have, _)| *have == rev) {
+        if self.art_rev == Some(rev) {
             return;
         }
-        let brush = bytes.and_then(|b| self.decode(b).ok());
-        if brush.is_none() {
+        self.art_rev = Some(rev);
+        self.art = bytes.and_then(|b| self.decode(b).ok());
+        if self.art.is_none() {
             self.art_colour = None;
         }
-        self.art = brush.map(|b| (rev, b));
     }
 
     pub fn has_art(&self) -> bool {
@@ -327,7 +329,7 @@ impl Gfx {
     }
 
     pub fn draw_art(&self, r: Rect, radius: f32, alpha: f32) {
-        let Some((_, brush)) = &self.art else { return };
+        let Some(brush) = &self.art else { return };
         unsafe {
             // Cover the square and centre the image, so wide video thumbnails are not squashed.
             let zoom = (r.w / self.art_size.0).max(r.h / self.art_size.1);
