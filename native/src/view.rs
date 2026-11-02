@@ -1,5 +1,6 @@
 //! What the notch shows in each state, and which parts of it you can click.
 use crate::agents::{self, Agent, Pill, PlanState, Run, SessionView, Status};
+use crate::audio;
 use crate::calendar::{self, Phase};
 use crate::gfx::{Align, Gfx, Rect};
 use crate::layout::{self, Mode, Shape, Tab, CANVAS_W};
@@ -75,6 +76,7 @@ pub struct Scene<'a> {
     pub shelf_receiving: bool,
     pub calendar: &'a calendar::State,
     pub page_scroll: usize,
+    pub wave: &'a audio::Levels,
     pub now_ms: u64,
     pub peek: Option<&'a str>,
     pub peek_status: Status,
@@ -114,6 +116,7 @@ pub fn draw(g: &mut Gfx, s: &Scene, hits: &mut Vec<(Rect, Action)>) {
     match s.mode {
         Mode::Open if open > 0.0 => draw_open(g, s, area, open, hits),
         Mode::Peek if s.shape.h > 22.0 => draw_peek(g, s, area),
+        Mode::Lyric if s.shape.h > 18.0 => draw_lyric_strip(g, s, area),
         _ => {}
     }
     g.unclip();
@@ -123,6 +126,33 @@ fn draw_peek(g: &mut Gfx, s: &Scene, a: Rect) {
     let Some(text) = s.peek else { return };
     g.circle(a.x + 20.0, a.h / 2.0, 4.0, status_colour(s.peek_status), 1.0);
     g.text(text, Rect { x: a.x + 32.0, y: 0.0, w: a.w - 46.0, h: a.h }, 12.0, true, Align::Left, WHITE, 1.0);
+}
+
+/// The line being sung. The pill's colour is hidden behind this, so agent news shows as a small dot.
+fn draw_lyric_strip(g: &mut Gfx, s: &Scene, a: Rect) {
+    let dot = match s.pill {
+        Pill::Working => Some(BLUE),
+        Pill::Finished => Some(GREEN),
+        Pill::Failed => Some(RED),
+        _ => None,
+    };
+    if let Some(hex) = dot {
+        g.circle(a.x + 14.0, a.h / 2.0, 3.5, hex, 1.0);
+    }
+    let text = lyrics::current_line(s.lyric_lines, s.media.position_now()).map_or("♪", |i| s.lyric_lines[i].text.as_str());
+    g.text(text, Rect { x: a.x + 24.0, y: 0.0, w: a.w - 48.0, h: a.h }, layout::LYRIC_TEXT, true, Align::Center, WHITE, 1.0);
+}
+
+/// Bars growing from their middle, each one a band of pitches in what is playing right now.
+fn draw_wave(g: &mut Gfx, levels: &audio::Levels, r: Rect, alpha: f32) {
+    let (bar, gap) = (3.0, 2.0);
+    let total = audio::BARS as f32 * (bar + gap) - gap;
+    let mid = r.y + r.h / 2.0;
+    for (i, level) in levels.iter().enumerate() {
+        let h = (level * r.h).max(bar);
+        let x = r.x + r.w - total + i as f32 * (bar + gap);
+        g.fill(Rect { x, y: mid - h / 2.0, w: bar, h }, bar / 2.0, WHITE, (0.45 + 0.5 * level) * alpha);
+    }
 }
 
 fn draw_open(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
@@ -144,7 +174,7 @@ fn draw_dots(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
         draw_tab_icons(g, s, a, alpha, hits);
         return;
     }
-    let (dot, wide, gap, cy) = (6.0, 20.0, 7.0, s.open_h - 9.0);
+    let (dot, wide, gap, cy) = (6.0, 20.0, 7.0, s.open_h - 8.0);
     let count = s.tabs.len() as f32;
     let total = wide + (count - 1.0) * (dot + gap);
     let mut x = a.x + (a.w - total) / 2.0;
@@ -165,7 +195,7 @@ fn draw_dots(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
 
 fn draw_tab_icons(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
     // Low and slim, in the strip below the page, so it never covers the controls.
-    let (cell, h) = (30.0, 22.0);
+    let (cell, h) = (30.0, 20.0);
     let total = s.tabs.len() as f32 * cell;
     let top = s.open_h - h - 1.0;
     let tray = Rect { x: a.x + (a.w - total) / 2.0 - 4.0, y: top, w: total + 8.0, h };
@@ -175,9 +205,9 @@ fn draw_tab_icons(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(R
         let action = Action::Tab(*tab);
         let fill = if *tab == s.tab { 0.2 } else if is_hovered(s, &action) { 0.1 } else { 0.0 };
         if fill > 0.0 {
-            g.fill(Rect { x: r.x + 2.0, y: r.y + 2.0, w: r.w - 4.0, h: r.h - 4.0 }, (r.h - 4.0) / 2.0, WHITE, fill * alpha);
+            g.fill(Rect { x: r.x + 2.0, y: r.y + 1.0, w: r.w - 4.0, h: r.h - 2.0 }, (r.h - 2.0) / 2.0, WHITE, fill * alpha);
         }
-        draw_tab_icon(g, *tab, r.x + r.w / 2.0, r.y + r.h / 2.0 + 1.0, alpha);
+        draw_tab_icon(g, *tab, r.x + r.w / 2.0, r.y + r.h / 2.0 + 1.5, alpha);
         hits.push((Rect { y: top, h: s.open_h - top, ..r }, action));
     }
 }
@@ -233,7 +263,7 @@ fn is_hovered(s: &Scene, action: &Action) -> bool {
 fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
     let m = s.media;
     if !m.present {
-        draw_empty_player(g, a, alpha);
+        draw_empty_player(g, s, a, alpha);
         return;
     }
     let split = s.lyrics_on && !s.lyric_lines.is_empty();
@@ -248,7 +278,9 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
         g.polygon(&[(art.x + 21.0, art.y + 18.0), (art.x + 37.0, art.y + 27.0), (art.x + 21.0, art.y + 36.0)], WHITE, 0.45 * alpha);
     }
     let tx = art.x + art.w + 12.0;
-    let tw = x + w - tx;
+    let wave_w = audio::BARS as f32 * 5.0 + 6.0;
+    draw_wave(g, s.wave, Rect { x: x + w - wave_w, y: 18.0, w: wave_w, h: 36.0 }, alpha);
+    let tw = x + w - tx - wave_w;
     let title = if m.title.is_empty() { "Unknown" } else { &m.title };
     g.text(title, Rect { x: tx, y: 16.0, w: tw, h: 22.0 }, 14.5, true, Align::Left, WHITE, alpha);
     g.text(&m.artist, Rect { x: tx, y: 38.0, w: tw, h: 18.0 }, 12.0, false, Align::Left, MUTED, alpha);
@@ -323,7 +355,7 @@ fn draw_transport(g: &mut Gfx, px: f32, cy: f32, action: &Action, playing: bool,
 }
 
 /// The player at rest: the same layout as a playing song, with nothing to press.
-fn draw_empty_player(g: &mut Gfx, a: Rect, alpha: f32) {
+fn draw_empty_player(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32) {
     let x = a.x + PAD + 4.0;
     let w = a.w - (PAD + 4.0) * 2.0;
     let art = Rect { x, y: 10.0, w: 54.0, h: 54.0 };
@@ -331,6 +363,11 @@ fn draw_empty_player(g: &mut Gfx, a: Rect, alpha: f32) {
     draw_tab_icon(g, Tab::Media, art.x + 26.0, art.y + 28.0, 0.45 * alpha);
     let tx = art.x + art.w + 12.0;
     let tw = x + w - tx;
+    // Sound from an app that doesn't report what it's playing still moves the bars.
+    if s.wave.iter().any(|level| *level > 0.0) {
+        let wave_w = audio::BARS as f32 * 5.0 + 6.0;
+        draw_wave(g, s.wave, Rect { x: x + w - wave_w, y: 18.0, w: wave_w, h: 36.0 }, alpha);
+    }
     g.text("Nothing playing", Rect { x: tx, y: 16.0, w: tw, h: 22.0 }, 14.5, true, Align::Left, WHITE, alpha);
     g.text("Play something in any app", Rect { x: tx, y: 38.0, w: tw, h: 18.0 }, 12.0, false, Align::Left, MUTED, alpha);
 

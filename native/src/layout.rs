@@ -9,11 +9,17 @@ const MEDIA_W: f32 = 320.0;
 const MEDIA_LYRICS_W: f32 = 540.0;
 const AGENTS_W: f32 = 440.0;
 const CALENDAR_W: f32 = 380.0;
+pub const LYRIC_TEXT: f32 = 12.5;
+const LYRIC_PAD: f32 = 26.0;
+const LYRIC_MIN_W: f32 = 140.0;
+const LYRIC_MAX_W: f32 = 560.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Rest,
     Peek,
+    /// Closed from the lyrics view: just the line being sung.
+    Lyric,
     Open,
 }
 
@@ -59,8 +65,14 @@ pub fn shape_for(mode: Mode) -> Shape {
     match mode {
         Mode::Rest => Shape { w: 56.0, h: 4.0, radius: 2.0, y: 2.0 },
         Mode::Peek => Shape { w: 280.0, h: 30.0, radius: 13.0, y: 0.0 },
+        Mode::Lyric => lyric_shape(0.0),
         Mode::Open => open_shape(MEDIA_W),
     }
+}
+
+/// Just wide enough for the line, within limits, and no deeper than it has to be.
+pub fn lyric_shape(text_w: f32) -> Shape {
+    Shape { w: (text_w + LYRIC_PAD * 2.0).clamp(LYRIC_MIN_W, LYRIC_MAX_W), h: 26.0, radius: 12.0, y: 0.0 }
 }
 
 pub fn open_shape(w: f32) -> Shape {
@@ -82,11 +94,13 @@ pub fn open_width(tab: Tab, lyrics_showing: bool, nothing_listed: bool) -> f32 {
 
 /// What the notch should be doing right now. Only the mouse or a question can hold it open,
 /// so a busy agent or playing music can never stop it from collapsing.
-pub fn target_mode(hovering: bool, needs_decision: bool, flashing: bool, has_tabs: bool) -> Mode {
+pub fn target_mode(hovering: bool, needs_decision: bool, flashing: bool, has_tabs: bool, lyric_strip: bool) -> Mode {
     if (hovering && has_tabs) || needs_decision {
         Mode::Open
     } else if flashing {
         Mode::Peek
+    } else if lyric_strip {
+        Mode::Lyric
     } else {
         Mode::Rest
     }
@@ -164,15 +178,31 @@ mod tests {
 
     #[test]
     fn it_always_collapses_when_nothing_holds_it() {
-        assert_eq!(target_mode(false, false, false, true), Mode::Rest);
-        assert_eq!(target_mode(true, false, false, true), Mode::Open);
-        assert_eq!(target_mode(false, true, false, true), Mode::Open);
-        assert_eq!(target_mode(false, false, true, true), Mode::Peek);
+        assert_eq!(target_mode(false, false, false, true, false), Mode::Rest);
+        assert_eq!(target_mode(true, false, false, true, false), Mode::Open);
+        assert_eq!(target_mode(false, true, false, true, false), Mode::Open);
+        assert_eq!(target_mode(false, false, true, true, false), Mode::Peek);
     }
 
     #[test]
     fn hovering_opens_nothing_without_a_feature() {
-        assert_eq!(target_mode(true, false, false, false), Mode::Rest);
+        assert_eq!(target_mode(true, false, false, false, false), Mode::Rest);
+    }
+
+    #[test]
+    fn the_lyric_strip_gives_way_to_everything_else() {
+        assert_eq!(target_mode(false, false, false, true, true), Mode::Lyric);
+        assert_eq!(target_mode(true, false, false, true, true), Mode::Open);
+        assert_eq!(target_mode(false, true, false, true, true), Mode::Open);
+        assert_eq!(target_mode(false, false, true, true, true), Mode::Peek);
+    }
+
+    #[test]
+    fn the_lyric_strip_fits_its_line_within_limits() {
+        assert_eq!(lyric_shape(0.0).w, LYRIC_MIN_W);
+        assert_eq!(lyric_shape(200.0).w, 200.0 + LYRIC_PAD * 2.0);
+        assert!(lyric_shape(5000.0).w * 1.03 < CANVAS_W);
+        assert!(lyric_shape(100.0).h < shape_for(Mode::Open).h / 4.0);
     }
 
     #[test]
@@ -198,7 +228,7 @@ mod tests {
 
     #[test]
     fn every_shape_fits_the_canvas() {
-        for mode in [Mode::Rest, Mode::Peek, Mode::Open] {
+        for mode in [Mode::Rest, Mode::Peek, Mode::Lyric, Mode::Open] {
             let s = shape_for(mode);
             assert!(s.w * 1.03 < CANVAS_W && s.h * 1.1 < CANVAS_H, "{mode:?} {s:?}");
         }

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! TwoCode: a notch at the top of the screen for your media and your coding agents.
 mod agents;
+mod audio;
 mod calendar;
 mod config;
 mod gfx;
@@ -44,6 +45,8 @@ const TIMER_TICK: usize = 3;
 const TIMER_FLASH: usize = 4;
 const TIMER_FULLSCREEN: usize = 5;
 const TIMER_RETRY: usize = 6;
+const TIMER_WAVE: usize = 7;
+const WAVE_FRAME_MS: u32 = 33;
 const WM_WHEEL: u32 = 0x020A;
 const DRAG_START_PX: f32 = 5.0;
 const AFTER_DROP_MS: u32 = 1500;
@@ -111,6 +114,12 @@ pub struct App {
     calendar_state: Arc<Mutex<calendar::State>>,
     calendar: calendar::State,
     calendar_tx: Sender<calendar::Command>,
+    wave_state: Arc<Mutex<audio::Levels>>,
+    wave: audio::Levels,
+    audio_tx: Sender<bool>,
+    listening: bool,
+    lyric_strip: bool,
+    opened_by_hover: bool,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -289,19 +298,36 @@ impl App {
         }
         // Typing or dragging a file holds the notch open, like the mouse does.
         let held = self.hovering || self.edit.is_some() || self.shelf_receiving;
-        let next = layout::target_mode(held, self.needs_decision(), self.flashing, !self.tabs().is_empty());
+        let has_tabs = !self.tabs().is_empty();
+        let mut next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, self.lyric_strip_ready());
+        // Only closing it yourself from the lyrics view leaves the line showing. A question that opened it decides nothing.
+        if next != Mode::Open && self.mode == Mode::Open {
+            if self.opened_by_hover {
+                self.lyric_strip = self.lyrics_view_showing();
+            }
+            self.opened_by_hover = false;
+            next = layout::target_mode(held, self.needs_decision(), self.flashing, has_tabs, self.lyric_strip_ready());
+        }
+        if next == Mode::Open && self.hovering {
+            self.opened_by_hover = true;
+        }
+        self.listen_to_audio(next == Mode::Open && self.config.tab == Tab::Media && self.config.media);
         if next == Mode::Open && self.mode != Mode::Open && self.config.tab == Tab::Calendar {
             let _ = self.calendar_tx.send(calendar::Command::Refresh);
         }
         self.note_viewing(next);
-        if next == Mode::Rest {
+        if matches!(next, Mode::Rest | Mode::Lyric) {
             self.selected = None;
             self.selected_run = None;
             self.runs_scroll = 0;
             self.page_scroll = 0;
             self.pressed = None;
         }
-        let to = if next == Mode::Open { layout::open_shape(self.open_width()) } else { layout::shape_for(next) };
+        let to = match next {
+            Mode::Open => layout::open_shape(self.open_width()),
+            Mode::Lyric => layout::lyric_shape(self.lyric_width()),
+            _ => layout::shape_for(next),
+        };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
             self.mode = next;
             self.motion = Some(Motion { from: self.shape, to, elapsed_ms: 0.0 });
@@ -313,6 +339,10 @@ impl App {
                 // Quick enough for a lyric line to change on time; slower when nothing depends on it.
                 let singing = self.config.tab == Tab::Media && self.config.lyrics && self.media.playing && !self.lyric_lines.is_empty();
                 SetTimer(Some(self.hwnd), TIMER_TICK, if singing { 200 } else { 1000 }, None);
+            } else if next == Mode::Lyric {
+                // Wakes when the line changes, and otherwise rarely.
+                let wait = lyrics::ms_to_next(&self.lyric_lines, self.media.position_now()).unwrap_or(1000).clamp(40, 1000);
+                SetTimer(Some(self.hwnd), TIMER_TICK, wait as u32, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), TIMER_TICK);
             }
@@ -320,9 +350,44 @@ impl App {
         self.dirty = true;
     }
 
-    /// Lyrics are only asked for while you are looking at the media page, once per song.
+    fn lyrics_view_showing(&self) -> bool {
+        self.config.tab == Tab::Media && self.config.media && self.config.lyrics && self.media.present && !self.lyric_lines.is_empty()
+    }
+
+    /// Paused, or a song with no timed lyrics, goes back to the plain pill until there is a line to follow.
+    fn lyric_strip_ready(&self) -> bool {
+        self.lyric_strip && self.config.media && self.config.lyrics && self.media.present && self.media.playing && !self.lyric_lines.is_empty()
+    }
+
+    fn lyric_width(&mut self) -> f32 {
+        let position = self.media.position_now();
+        let text = lyrics::current_line(&self.lyric_lines, position).map_or("♪".to_string(), |i| self.lyric_lines[i].text.clone());
+        self.gfx.as_mut().map_or(0.0, |g| g.text_width(&text, layout::LYRIC_TEXT, true))
+    }
+
+    /// The waveform listens only while you can see it.
+    fn listen_to_audio(&mut self, wanted: bool) {
+        if wanted == self.listening {
+            return;
+        }
+        self.listening = wanted;
+        let _ = self.audio_tx.send(wanted);
+        unsafe {
+            if wanted {
+                SetTimer(Some(self.hwnd), TIMER_WAVE, WAVE_FRAME_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_WAVE);
+            }
+        }
+        if !wanted {
+            self.wave = [0.0; audio::BARS];
+        }
+    }
+
+    /// Lyrics are asked for on the media page, or for the next song while its line is on the notch. Once per song.
     fn ask_for_lyrics(&mut self) {
-        let looking = self.mode == Mode::Open && self.config.tab == Tab::Media && self.config.media && self.config.lyrics;
+        let on_page = self.mode == Mode::Open && self.config.tab == Tab::Media;
+        let looking = (on_page || self.lyric_strip) && self.config.media && self.config.lyrics;
         let key = song_key(&self.media);
         if !looking || !self.media.present || self.media.title.is_empty() || key == self.lyrics_asked {
             return;
@@ -503,7 +568,10 @@ impl App {
         self.config.tab = tab;
         self.config.save();
         self.page_scroll = 0;
-        self.hovered = None;
+        // Still pointing at the tabs: they stay as icons until the mouse leaves them.
+        if !matches!(self.hovered, Some(Action::Tab(_))) {
+            self.hovered = None;
+        }
         if tab == Tab::Calendar {
             let _ = self.calendar_tx.send(calendar::Command::Refresh);
         }
@@ -568,6 +636,7 @@ impl App {
             shelf_receiving: self.shelf_receiving,
             calendar: &self.calendar,
             page_scroll: self.page_scroll,
+            wave: &self.wave,
             now_ms,
             pill: if self.config.agents { agents::pill_state(&self.sessions) } else { agents::Pill::Quiet },
             sessions: &self.sessions,
@@ -795,7 +864,7 @@ impl App {
 
     fn timer(&mut self, id: usize) {
         unsafe {
-            if id != TIMER_TICK && id != TIMER_FULLSCREEN {
+            if id != TIMER_TICK && id != TIMER_FULLSCREEN && id != TIMER_WAVE {
                 let _ = KillTimer(Some(self.hwnd), id);
             }
         }
@@ -813,6 +882,13 @@ impl App {
                 self.settle();
             }
             TIMER_TICK => self.pull_state(),
+            TIMER_WAVE => {
+                let levels = self.wave_state.lock().map_or([0.0; audio::BARS], |w| *w);
+                if levels != self.wave {
+                    self.wave = levels;
+                    self.dirty = true;
+                }
+            }
             TIMER_FULLSCREEN => self.check_fullscreen(),
             TIMER_RETRY => self.recreate_graphics(),
             _ => {}
@@ -942,6 +1018,8 @@ fn main() {
         let lyrics_tx = lyrics::start(lyrics_store.clone(), tell_window);
         let calendar_state = Arc::new(Mutex::new(calendar::State::default()));
         let calendar_tx = calendar::start(calendar_state.clone(), tell_window);
+        let wave_state = Arc::new(Mutex::new([0.0; audio::BARS]));
+        let audio_tx = audio::start(wave_state.clone());
         let shelf_dropped = Arc::new(Mutex::new(vec![]));
         shelf::accept_drops(hwnd, shelf_dropped.clone());
 
@@ -993,6 +1071,12 @@ fn main() {
             calendar_state,
             calendar: calendar::State::default(),
             calendar_tx,
+            wave_state,
+            wave: [0.0; audio::BARS],
+            audio_tx,
+            listening: false,
+            lyric_strip: false,
+            opened_by_hover: false,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

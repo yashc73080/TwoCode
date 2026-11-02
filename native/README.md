@@ -21,6 +21,7 @@ The app is `target/release/twocode.exe`. Right-click the notch or its tray icon 
 | `src/watcher.rs` | Follows `~/.claude/projects` and `~/.codex/sessions` |
 | `src/hooks.rs` | Optional Allow and Deny: a local hook server and the `settings.json` entries |
 | `src/media.rs` | Now playing and controls through the Windows media API |
+| `src/audio.rs` | Bar heights for the waveform, from what Windows is playing |
 | `src/calendar.rs` | Google sign-in and upcoming events |
 | `src/todos.rs` | The todo list and its one-line editor |
 | `src/shelf.rs` | Files parked in the notch, with drag in and out |
@@ -32,6 +33,8 @@ The app is `target/release/twocode.exe`. Right-click the notch or its tray icon 
 Tracking only reads local files and changes none of your settings. Turning on **Allow or Deny from the notch** adds hooks to `~/.claude/settings.json` or `~/.codex/hooks.json`, keeping a backup next to the file. Codex asks you to trust a new hook once. Turning it off removes them, including any left by the old Electron TwoCode.
 
 When no agent is working, the agents page lists what finished in the last 3 hours. Those runs are saved to `recent.json` on this PC, including what you asked and which files changed, and older ones are dropped. Turn off **Show recent runs** to hide them and stop saving new ones.
+
+The waveform listens to what your PC is playing only while the media page is open. It keeps nothing but the current bar heights, and never uses the microphone.
 
 Todos are saved to `todos.json`. The shelf saves only file paths to `shelf.json`: it doesn't copy or move anything, and dragging a file out makes a copy.
 

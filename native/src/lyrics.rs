@@ -202,6 +202,11 @@ pub unsafe fn read_response(request: *mut core::ffi::c_void, send: bool) -> Opti
     String::from_utf8(body).ok()
 }
 
+/// How long until the line changes, so a waiting timer can wake exactly then.
+pub fn ms_to_next(lines: &[Line], position_ms: u64) -> Option<u64> {
+    lines.get(lines.partition_point(|l| l.at_ms <= position_ms)).map(|l| l.at_ms - position_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +241,14 @@ mod tests {
         assert_eq!(current_line(&lines, 10_000), Some(0));
         assert_eq!(current_line(&lines, 99_000), Some(1));
         assert_eq!(current_line(&[], 5), None);
+    }
+
+    #[test]
+    fn knows_when_the_next_line_comes() {
+        let lines = parse_lrc("[00:10.00]a\n[00:20.00]b");
+        assert_eq!(ms_to_next(&lines, 4_000), Some(6_000));
+        assert_eq!(ms_to_next(&lines, 15_000), Some(5_000));
+        assert_eq!(ms_to_next(&lines, 20_000), None);
     }
 
     #[test]
