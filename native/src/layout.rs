@@ -80,6 +80,11 @@ pub fn lyric_shape(text_w: f32) -> Shape {
     Shape { w: (text_w + LYRIC_PAD * 2.0).clamp(LYRIC_MIN_W, LYRIC_MAX_W), h: 26.0, radius: 12.0, y: 0.0 }
 }
 
+/// The pop-up when headphones connect: a short card, still well above the open notch's depth.
+pub fn device_shape() -> Shape {
+    Shape { w: 330.0, h: 58.0, radius: 22.0, y: 0.0 }
+}
+
 pub fn open_shape(w: f32) -> Shape {
     Shape { w, h: 140.0, radius: 22.0, y: 0.0 }
 }
@@ -248,6 +253,7 @@ mod tests {
 
     #[test]
     fn every_shape_fits_the_canvas() {
+        assert!(device_shape().h < shape_for(Mode::Open).h / 2.0);
         for mode in [Mode::Rest, Mode::Peek, Mode::Lyric, Mode::Open] {
             let s = shape_for(mode);
             assert!(s.w * 1.03 < CANVAS_W && s.h * 1.1 < CANVAS_H, "{mode:?} {s:?}");

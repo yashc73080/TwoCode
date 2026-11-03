@@ -19,6 +19,8 @@ const BLUE: u32 = 0x60A5FA;
 const CLAUDE: u32 = 0xE08A5F;
 const CODEX: u32 = 0x7DD3C0;
 const PAD: f32 = 16.0;
+/// Myna UI Icons, MIT: see assets/LICENSE-mynaui-icons.txt.
+const AIRPODS_SVG: &str = include_str!("../assets/airpods.svg");
 const MUSIC_W: f32 = 250.0;
 pub const RUN_ROWS: usize = 3;
 pub const TODO_ROWS: usize = 3;
@@ -84,6 +86,7 @@ pub struct Scene<'a> {
     pub now_ms: u64,
     pub peek: Option<&'a str>,
     pub peek_status: Status,
+    pub device: Option<&'a crate::bluetooth::Notice>,
     pub hovered: Option<&'a Action>,
 }
 
@@ -119,6 +122,7 @@ pub fn draw(g: &mut Gfx, s: &Scene, hits: &mut Vec<(Rect, Action)>) {
     g.clip(area);
     match s.mode {
         Mode::Open if open > 0.0 => draw_open(g, s, area, open, hits),
+        Mode::Peek if s.device.is_some() => draw_device(g, s, area),
         Mode::Peek if s.shape.h > 22.0 => draw_peek(g, s, area),
         Mode::Lyric if s.shape.h > 18.0 => match s.reminder {
             Some(text) => draw_reminder(g, s, text, area, hits),
@@ -127,6 +131,56 @@ pub fn draw(g: &mut Gfx, s: &Scene, hits: &mut Vec<(Rect, Action)>) {
         _ => {}
     }
     g.unclip();
+}
+
+/// Headphones connecting or leaving: what they are, and their battery when Windows knows it.
+fn draw_device(g: &mut Gfx, s: &Scene, a: Rect) {
+    let Some(d) = s.device else { return };
+    let alpha = layout::content_alpha(s.shape.h, layout::device_shape().h);
+    if alpha <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (a.x + 32.0, a.h / 2.0);
+    g.circle(cx, cy, 17.0, WHITE, 0.1 * alpha);
+    let tint = if d.connected { WHITE } else { FAINT };
+    if d.name.to_lowercase().contains("airpods") {
+        g.svg(AIRPODS_SVG, 24.0, Rect { x: cx - 11.0, y: cy - 11.0, w: 22.0, h: 22.0 }, tint, alpha);
+    } else {
+        draw_headphones(g, cx, cy, tint, alpha);
+    }
+    let tx = a.x + 58.0;
+    let right = if d.battery.is_some() { 74.0 } else { 16.0 };
+    let tw = a.x + a.w - right - tx;
+    g.text(&d.name, Rect { x: tx, y: cy - 19.0, w: tw, h: 20.0 }, 13.5, true, Align::Left, WHITE, alpha);
+    let (state, hex) = if d.connected { ("Connected", GREEN) } else { ("Disconnected", MUTED) };
+    g.text(state, Rect { x: tx, y: cy + 1.0, w: tw, h: 18.0 }, 11.5, false, Align::Left, hex, alpha);
+    if let Some(level) = d.battery {
+        let body = Rect { x: a.x + a.w - 70.0, y: cy - 6.5, w: 25.0, h: 13.0 };
+        let fill = if level <= 20 { RED } else { GREEN };
+        g.fill(body, 3.5, WHITE, 0.35 * alpha);
+        g.fill(Rect { x: body.x + 1.5, y: body.y + 1.5, w: body.w - 3.0, h: body.h - 3.0 }, 2.5, 0x000000, alpha);
+        g.fill(Rect { x: body.x + 2.5, y: body.y + 2.5, w: (body.w - 5.0) * level as f32 / 100.0, h: body.h - 5.0 }, 1.5, fill, alpha);
+        g.fill(Rect { x: body.x + body.w + 1.0, y: cy - 2.5, w: 2.0, h: 5.0 }, 1.0, WHITE, 0.35 * alpha);
+        g.text(&format!("{level}%"), Rect { x: body.x + body.w + 5.0, y: cy - 9.0, w: 40.0, h: 18.0 }, 11.5, true, Align::Left, WHITE, alpha);
+    }
+}
+
+/// A headband over two ear cups, as one outline for the band and two rounded cups.
+fn draw_headphones(g: &mut Gfx, cx: f32, cy: f32, hex: u32, alpha: f32) {
+    const STEPS: usize = 14;
+    let (outer, inner) = (9.0, 7.2);
+    let mut band = vec![];
+    for i in 0..=STEPS {
+        let angle = std::f32::consts::PI * (1.0 + i as f32 / STEPS as f32);
+        band.push((cx + outer * angle.cos(), cy + 1.0 + outer * angle.sin()));
+    }
+    for i in (0..=STEPS).rev() {
+        let angle = std::f32::consts::PI * (1.0 + i as f32 / STEPS as f32);
+        band.push((cx + inner * angle.cos(), cy + 1.0 + inner * angle.sin()));
+    }
+    g.polygon(&band, hex, alpha);
+    g.fill(Rect { x: cx - 10.0, y: cy, w: 5.5, h: 9.0 }, 2.0, hex, alpha);
+    g.fill(Rect { x: cx + 4.5, y: cy, w: 5.5, h: 9.0 }, 2.0, hex, alpha);
 }
 
 fn draw_peek(g: &mut Gfx, s: &Scene, a: Rect) {

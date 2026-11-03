@@ -150,6 +150,19 @@ impl Gfx {
         }
     }
 
+    /// Draws a one-colour SVG icon into `r`. `view` is the icon's own size; `currentColor` in it becomes `hex`.
+    pub fn svg(&self, svg: &str, view: f32, r: Rect, hex: u32, alpha: f32) {
+        let text = svg.replace("fill=\"currentColor\"", &format!("fill=\"#{hex:06X}\" fill-opacity=\"{alpha:.3}\""));
+        let Ok(dc) = self.dc.cast::<ID2D1DeviceContext5>() else { return };
+        unsafe {
+            let Some(stream) = SHCreateMemStream(Some(text.as_bytes())) else { return };
+            let Ok(doc) = dc.CreateSvgDocument(&stream, D2D_SIZE_F { width: view, height: view }) else { return };
+            dc.SetTransform(&matrix(self.scale * r.w / view, r.x * self.scale, r.y * self.scale));
+            dc.DrawSvgDocument(&doc);
+            dc.SetTransform(&matrix(self.scale, 0.0, 0.0));
+        }
+    }
+
     /// Until `unscaled`, draws everything larger or smaller around this point.
     pub fn scaled(&self, cx: f32, cy: f32, by: f32) {
         unsafe { self.dc.SetTransform(&matrix(self.scale * by, cx * (1.0 - by) * self.scale, cy * (1.0 - by) * self.scale)) }

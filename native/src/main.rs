@@ -2,6 +2,7 @@
 //! TwoCode: a notch at the top of the screen for your media and your coding agents.
 mod agents;
 mod audio;
+mod bluetooth;
 mod calendar;
 mod config;
 mod gfx;
@@ -89,6 +90,8 @@ pub struct App {
     finished_seen: u64,
     peek_text: String,
     peek_status: Status,
+    device_state: Arc<Mutex<Option<bluetooth::Notice>>>,
+    device: Option<bluetooth::Notice>,
     flashing: bool,
     hovering: bool,
     tracking: bool,
@@ -256,6 +259,25 @@ impl App {
         if let Ok(state) = self.calendar_state.lock() {
             self.calendar = state.clone();
         }
+        let notice = self.device_state.lock().ok().and_then(|n| n.clone());
+        if let Some(notice) = notice {
+            let new_event = self.device.as_ref().is_none_or(|d| d.id != notice.id);
+            let showing = self.device.is_some();
+            if new_event && self.config.bluetooth {
+                self.device = Some(notice);
+                self.flashing = true;
+                unsafe {
+                    SetTimer(Some(self.hwnd), TIMER_FLASH, FLASH_MS, None);
+                }
+            } else if showing {
+                self.device = Some(notice); // the battery level arriving a moment later
+            }
+            if let Ok(mut state) = self.device_state.lock() {
+                if !self.config.bluetooth || !new_event || self.device.is_some() {
+                    *state = None;
+                }
+            }
+        }
         if self.mode == Mode::Open && self.config.tab == Tab::Shelf {
             let before = self.shelf.len();
             self.shelf.retain(|item| std::path::Path::new(&item.path).exists());
@@ -341,6 +363,7 @@ impl App {
         let to = match next {
             Mode::Open => layout::open_shape(self.open_width()),
             Mode::Lyric => layout::lyric_shape(self.lyric_width()),
+            Mode::Peek if self.device.is_some() => layout::device_shape(),
             _ => layout::shape_for(next),
         };
         if next != self.mode || self.motion.as_ref().map_or(self.shape != to, |m| m.to != to) {
@@ -692,6 +715,7 @@ impl App {
             sessions: &self.sessions,
             peek: Some(&self.peek_text),
             peek_status: self.peek_status,
+            device: self.device.as_ref(),
             hovered: self.hovered.as_ref(),
         };
         gfx.begin();
@@ -955,6 +979,7 @@ impl App {
             }
             TIMER_FLASH => {
                 self.flashing = false;
+                self.device = None;
                 self.settle();
             }
             TIMER_TICK => self.pull_state(),
@@ -1107,6 +1132,8 @@ fn main() {
         let lyrics_tx = lyrics::start(lyrics_store.clone(), tell_window);
         let calendar_state = Arc::new(Mutex::new(calendar::State::default()));
         let calendar_tx = calendar::start(calendar_state.clone(), tell_window);
+        let device_state = Arc::new(Mutex::new(None));
+        bluetooth::start(device_state.clone(), tell_window);
         let wave_state = Arc::new(Mutex::new([0.0; audio::BARS]));
         let audio_tx = audio::start(wave_state.clone());
         let shelf_dropped = Arc::new(Mutex::new(vec![]));
@@ -1130,6 +1157,8 @@ fn main() {
             finished_seen: 0,
             peek_text: String::new(),
             peek_status: Status::Done,
+            device_state,
+            device: None,
             flashing: false,
             hovering: false,
             tracking: false,
