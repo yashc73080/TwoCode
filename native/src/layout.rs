@@ -8,11 +8,17 @@ const DURATION_MS: f32 = 240.0;
 pub const TAB_DOT_SPACING: f32 = 16.0;
 pub const TAB_ICON_SPACING: f32 = 30.0;
 pub const TAB_ROW_FROM_BOTTOM: f32 = 11.0;
+pub const TAB_ARROW_INSET: f32 = 7.0;
+/// One notch of a sideways wheel, and the pause after a swipe before it can switch again.
+pub const SIDEWAYS_STEP: i32 = 120;
+pub const SIDEWAYS_PAUSE_MS: u128 = 350;
 const TAB_SPEED: f32 = 16.0; // how quickly the picker catches up, per second
-const MEDIA_W: f32 = 320.0;
-const MEDIA_LYRICS_W: f32 = 540.0;
-const AGENTS_W: f32 = 440.0;
-const CALENDAR_W: f32 = 380.0;
+/// Room on each side of every page for the tab arrows; the pages keep their old widths inside it.
+pub const ARROW_GUTTER: f32 = 8.0;
+const MEDIA_W: f32 = 320.0 + ARROW_GUTTER * 2.0;
+const MEDIA_LYRICS_W: f32 = 540.0 + ARROW_GUTTER * 2.0;
+const AGENTS_W: f32 = 440.0 + ARROW_GUTTER * 2.0;
+const CALENDAR_W: f32 = 380.0 + ARROW_GUTTER * 2.0;
 pub const LYRIC_TEXT: f32 = 12.5;
 pub const STRIP_CLOSE_W: f32 = 28.0;
 const LYRIC_PAD: f32 = 26.0;
@@ -147,6 +153,20 @@ pub fn tab_x(mid: f32, index: f32, count: usize, spacing: f32) -> f32 {
     mid + (index - (count as f32 - 1.0) / 2.0) * spacing
 }
 
+/// Adds up sideways scrolling. A touchpad sends many small amounts, so a whole swipe moves one tab.
+/// Returns the direction to move, if any, and the new running total.
+pub fn sideways(total: i32, delta: i32, since_last_ms: u128) -> (Option<bool>, i32) {
+    if since_last_ms < SIDEWAYS_PAUSE_MS {
+        return (None, 0);
+    }
+    let total = total + delta;
+    if total.abs() >= SIDEWAYS_STEP {
+        (Some(total > 0), 0)
+    } else {
+        (None, total)
+    }
+}
+
 /// Moves a value toward its goal, fast at first and gently at the end, however long the frame took.
 pub fn ease_toward(value: f32, goal: f32, seconds: f32) -> f32 {
     let next = value + (goal - value) * (1.0 - (-TAB_SPEED * seconds).exp());
@@ -261,10 +281,36 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_stay_inside_their_gutter() {
+        // A chevron reaches about 3.4 past its centre toward the page; the page's scrollbars start 8 inside it.
+        assert!(TAB_ARROW_INSET + 3.4 < ARROW_GUTTER + 8.0 - 2.0);
+        assert!(TAB_ARROW_INSET - 2.0 > 0.0);
+    }
+
+    #[test]
     fn the_tab_row_is_centred() {
         assert_eq!(tab_x(100.0, 0.0, 3, 30.0), 70.0);
         assert_eq!(tab_x(100.0, 1.0, 3, 30.0), 100.0);
         assert_eq!(tab_x(100.0, 0.5, 2, 30.0), 100.0);
+    }
+
+    #[test]
+    fn a_sideways_swipe_moves_one_tab() {
+        let (mut total, mut moves) = (0, vec![]);
+        let mut since = 10_000;
+        for _ in 0..12 {
+            let (step, next) = sideways(total, 40, since);
+            total = next;
+            if let Some(forward) = step {
+                moves.push(forward);
+                since = 0;
+            } else {
+                since += 16;
+            }
+        }
+        assert_eq!(moves, [true]);
+        assert_eq!(sideways(0, -120, 10_000), (Some(false), 0));
+        assert_eq!(sideways(0, 60, 10_000), (None, 60));
     }
 
     #[test]

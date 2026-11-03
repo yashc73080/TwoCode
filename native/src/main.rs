@@ -54,6 +54,7 @@ const TRIM_AFTER_MS: u32 = 30_000;
 const REMINDER_CHECK_MS: u32 = 15_000;
 const WAVE_FRAME_MS: u32 = 33;
 const WM_WHEEL: u32 = 0x020A;
+const WM_SIDEWAYS_WHEEL: u32 = 0x020E;
 const DRAG_START_PX: f32 = 5.0;
 const AFTER_DROP_MS: u32 = 1500;
 const OPEN_DELAY_MS: u32 = 110;
@@ -130,6 +131,8 @@ pub struct App {
     opened_by_hover: bool,
     menu: Option<HWND>,
     menu_holds_open: bool,
+    sideways_total: i32,
+    last_sideways_step: Instant,
     reminder: Option<calendar::Event>,
     dismissed: Vec<(String, u64)>,
     tab_reveal: f32,
@@ -605,12 +608,24 @@ impl App {
             Tab::Calendar if self.calendar.phase == calendar::Phase::Ready => self.calendar.events.iter().filter(|e| e.end_ms > now).count().saturating_sub(view::EVENT_ROWS),
             _ => 0,
         };
-        if !over_tabs && last > 0 {
+        if over_tabs {
+            self.next_tab(down);
+        } else if last > 0 {
             self.page_scroll = if down { (self.page_scroll + 1).min(last) } else { self.page_scroll.saturating_sub(1) };
             self.hovered = None;
             self.dirty = true;
-        } else {
-            self.next_tab(down);
+        }
+    }
+
+    /// Scrolling sideways, on a touchpad or a tilting wheel, moves between tabs.
+    /// The tabs follow your fingers: a touchpad reports a swipe to the left as scrolling right, so the sign flips.
+    fn sideways_wheel(&mut self, delta: i32) {
+        let since = self.last_sideways_step.elapsed().as_millis();
+        let (step, total) = layout::sideways(self.sideways_total, -delta, since);
+        self.sideways_total = total;
+        if let Some(forward) = step {
+            self.last_sideways_step = Instant::now();
+            self.next_tab(forward);
         }
     }
 
@@ -629,7 +644,7 @@ impl App {
         self.config.save();
         self.page_scroll = 0;
         // Still pointing at the tabs: they stay as icons until the mouse leaves them.
-        if !matches!(self.hovered, Some(Action::Tab(_))) {
+        if !matches!(self.hovered, Some(Action::Tab(_) | Action::TabStep(_))) {
             self.hovered = None;
         }
         if tab == Tab::Calendar {
@@ -869,6 +884,7 @@ impl App {
             Some(Action::Allow(agent, id)) => self.answer(agent, &id, true),
             Some(Action::Deny(agent, id)) => self.answer(agent, &id, false),
             Some(Action::Tab(tab)) => self.choose_tab(tab),
+            Some(Action::TabStep(forward)) => self.next_tab(forward),
             Some(Action::Open(agent, id)) => {
                 self.selected = Some((agent, id));
                 self.auto_selected = false;
@@ -1070,6 +1086,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSELEAVE => app.mouse_leave(),
         WM_LBUTTONUP => app.click(lparam),
         WM_WHEEL => app.wheel(((wparam.0 >> 16) as u16 as i16) < 0),
+        WM_SIDEWAYS_WHEEL => app.sideways_wheel((wparam.0 >> 16) as u16 as i16 as i32),
         WM_RBUTTONUP => menu::open(app, true),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR => {
@@ -1197,6 +1214,8 @@ fn main() {
             opened_by_hover: false,
             menu: None,
             menu_holds_open: false,
+            sideways_total: 0,
+            last_sideways_step: Instant::now(),
             reminder: None,
             dismissed: vec![],
             tab_reveal: 0.0,

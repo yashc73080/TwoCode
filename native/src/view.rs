@@ -19,6 +19,8 @@ const BLUE: u32 = 0x60A5FA;
 const CLAUDE: u32 = 0xE08A5F;
 const CODEX: u32 = 0x7DD3C0;
 const PAD: f32 = 16.0;
+/// Scrollbars sit this far in from the page's right edge, clear of the tab arrow beside it.
+const SCROLLBAR_INSET: f32 = 8.0;
 /// Myna UI Icons, MIT: see assets/LICENSE-mynaui-icons.txt.
 const AIRPODS_SVG: &str = include_str!("../assets/airpods.svg");
 const MUSIC_W: f32 = 250.0;
@@ -38,6 +40,8 @@ pub enum Action {
     Allow(Agent, String),
     Deny(Agent, String),
     Tab(Tab),
+    /// The arrows beside the tab row: true goes to the next tab.
+    TabStep(bool),
     Open(Agent, String),
     Back,
     Jump(Agent, String),
@@ -230,12 +234,14 @@ fn draw_wave(g: &mut Gfx, levels: &audio::Levels, r: Rect, alpha: f32) {
 }
 
 fn draw_open(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, Action)>) {
+    // The page sits inside the gutters the arrows live in.
+    let page = Rect { x: a.x + layout::ARROW_GUTTER, w: a.w - layout::ARROW_GUTTER * 2.0, ..a };
     match s.tab {
-        Tab::Media => draw_music(g, s, a, alpha, hits),
-        Tab::Agents => draw_agents(g, s, a, alpha, hits),
-        Tab::Calendar => draw_calendar(g, s, a, alpha, hits),
-        Tab::Todos => draw_todos(g, s, a, alpha, hits),
-        Tab::Shelf => draw_shelf(g, s, a, alpha, hits),
+        Tab::Media => draw_music(g, s, page, alpha, hits),
+        Tab::Agents => draw_agents(g, s, page, alpha, hits),
+        Tab::Calendar => draw_calendar(g, s, page, alpha, hits),
+        Tab::Todos => draw_todos(g, s, page, alpha, hits),
+        Tab::Shelf => draw_shelf(g, s, page, alpha, hits),
     }
     if s.tabs.len() > 1 {
         draw_tab_picker(g, s, a, alpha, hits);
@@ -276,6 +282,29 @@ fn draw_tab_picker(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(
         let hit_top = s.open_h - layout::TAB_ROW_FROM_BOTTOM * 2.0 - 1.0;
         hits.push((Rect { x: hit_x - layout::TAB_ICON_SPACING / 2.0, y: hit_top, w: layout::TAB_ICON_SPACING, h: s.open_h - hit_top }, action));
     }
+    // An arrow on each side, halfway down the page, drawn like the icons: quiet until pointed at.
+    // Its target is a slim strip along the edge, so it never takes clicks meant for the page.
+    let ay = (s.open_h - layout::TAB_ROW_FROM_BOTTOM * 2.0) / 2.0;
+    for forward in [false, true] {
+        let action = Action::TabStep(forward);
+        let x = if forward { a.x + a.w - layout::TAB_ARROW_INSET } else { a.x + layout::TAB_ARROW_INSET };
+        let over = is_hovered(s, &action);
+        g.polygon(&chevron(x, ay, forward), WHITE, if over { 0.85 } else { 0.28 } * alpha);
+        let edge = if forward { x - 7.0 } else { a.x };
+        hits.push((Rect { x: edge, y: ay - 18.0, w: layout::TAB_ARROW_INSET + 7.0, h: 36.0 }, action));
+    }
+}
+
+/// A shallow "<" or ">" as one thin outline: wide open, so it reads as a hint rather than a button.
+fn chevron(x: f32, y: f32, forward: bool) -> Vec<(f32, f32)> {
+    let side = if forward { -1.0 } else { 1.0 };
+    let (reach, height, thick): (f32, f32, f32) = (1.8, 4.6, 1.25);
+    // Shifting an arm sideways by `shift` gives it this thickness measured across it.
+    let shift = thick * (4.0 * reach * reach + height * height).sqrt() / height;
+    [(reach, -height), (reach + shift, -height), (-reach + shift, 0.0), (reach + shift, height), (reach, height), (-reach, 0.0)]
+        .iter()
+        .map(|(dx, dy)| (x + dx * side, y + dy))
+        .collect()
 }
 
 fn draw_tab_icon(g: &mut Gfx, tab: Tab, cx: f32, cy: f32, alpha: f32) {
@@ -706,7 +735,7 @@ fn draw_todos(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
     if s.todos.len() > TODO_ROWS {
         let track = row_h * TODO_ROWS as f32 - 6.0;
         let y = 41.0 + track * scroll as f32 / s.todos.len() as f32;
-        g.fill(Rect { x: a.x + a.w - 7.0, y, w: 2.5, h: track * TODO_ROWS as f32 / s.todos.len() as f32 }, 1.2, WHITE, 0.35 * alpha);
+        g.fill(Rect { x: a.x + a.w - SCROLLBAR_INSET, y, w: 2.5, h: track * TODO_ROWS as f32 / s.todos.len() as f32 }, 1.2, WHITE, 0.35 * alpha);
     }
 }
 
@@ -930,7 +959,7 @@ fn draw_runs(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
         let track = row_h * RUN_ROWS as f32 - 6.0;
         let thumb = track * RUN_ROWS as f32 / s.runs.len() as f32;
         let y = top + 2.0 + track * scroll as f32 / s.runs.len() as f32;
-        g.fill(Rect { x: a.x + a.w - 6.0, y, w: 2.5, h: thumb }, 1.2, WHITE, 0.35 * alpha);
+        g.fill(Rect { x: a.x + a.w - SCROLLBAR_INSET, y, w: 2.5, h: thumb }, 1.2, WHITE, 0.35 * alpha);
     }
 }
 
