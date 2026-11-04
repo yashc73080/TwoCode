@@ -1,86 +1,122 @@
-<p align="center"><img src="assets/icon-256.png" width="120" alt="Robo"></p>
+<p align="center"><img src="assets/icon-256.png" width="120" alt="TwoCode icon"></p>
 
 <h1 align="center">TwoCode</h1>
-<p align="center"><b>A Dynamic Island for Windows, with Robo living inside it.</b><br>
-Robo shows what Claude Code and Codex are doing, asks before your AI does something important, and tells you when the work is done.</p>
+<p align="center"><b>A notch for Windows that shows your music and your Claude Code and Codex agents.</b><br>
+It rests as a thin pill at the top of the screen and opens when you point at it.</p>
 
-<p align="center"><b>🧪 Public beta</b> · Windows 10 and 11 · free</p>
-
----
-
-## Download and install (2 minutes)
-
-1. Go to **[Releases](../../releases/latest)** and download **`TwoCode-Windows.zip`**.
-2. Right-click the zip → **Extract All…** (for example to `Documents\TwoCode`).
-3. Open the `TwoCode` folder and double-click **`TwoCode.exe`**.
-4. Windows may say *"Windows protected your PC"*. That's because the app is new and not signed yet. Click **More info → Run anyway**.
-
-The island appears at the top of your screen and Robo says hi. No installer, no account.
-
-**Tips**
-- **Ctrl+Alt+T** opens the island. **Ctrl+Alt+1–6** jumps straight to an app.
-- Right-click **Robo next to the clock** (bottom right) → **Start with Windows**, so TwoCode is always there.
-- Settings have their own app: **TwoCode Settings** in your Start menu (or the ⚙ in the island).
-
-### Connect Claude Code or Codex
-
-Open the island → **Settings → AI** and switch on **Claude Code** and/or **Codex**. From then on Robo follows your sessions by himself. Nothing about your code leaves your PC.
-
-### Closing and updating
-
-- Close: the **⏻ button** top right in the island, or right-click **Robo next to the clock** → **Quit TwoCode**.
-- Update: download the new zip from Releases, quit TwoCode and replace the old folder. Your settings stay.
+<p align="center">Windows 10 and 11 · Rust, with no web engine · about 50 MB of memory</p>
 
 ---
 
 ## What it does
 
-| | |
+| Tab | What you get |
 | --- | --- |
-| **Claude Code and Codex, live** | See which file your AI reads, what it edits and which command it runs. The island glows in your own colours for busy, done and error |
-| **Allow in one click** | Your AI asks permission (say for `npm install`)? Allow or Deny right in the island |
-| **A sign when it's done** | A chime, the done colour, and what changed. Click it to see the whole answer and your history |
-| **Robo, your buddy** | Drag Robo onto any window and ask him what's going on. He uses the AI you connected, sees the screenshot and explains it |
-| **Fix it for me** | Robo spots an error, proposes the fix, **asks before he touches a file**, then types the change into it while you watch |
-| **5-hour limit** | A ring shows how much of your Claude limit you've used |
-| **Spotify** | Controls, a song progress line, and switch where it plays (phone, laptop, speaker) |
-| **Tray, clipboard, note, focus** | Drop files on the island, your last copies, one quick note and a focus timer |
-| **Robo** | Moods, outfits, colours. He blinks, dances to music, and gets dizzy if you poke him too often |
+| **Media** | Whatever is playing in any app, with controls, a seek bar, synced lyrics from [LRCLIB](https://lrclib.net) and a waveform that follows the sound |
+| **Agents** | Every Claude Code and Codex session on this PC, from the terminal, an editor or the desktop apps: what it's doing now, its task list, and whether it's stuck or waiting for you |
+| **Calendar** | Your Google Calendar events for the next 7 days, with a Join button for video calls |
+| **Todos** | A quick list you can add to, edit, tick off and delete right in the notch |
+| **Shelf** | Drag files onto the pill to park them, then drag them back out when you need them |
 
-## This is a beta
+The closed pill also tells you things without opening:
 
-Things can still be rough. Tell us what you like and what you don't: **info@twocode.nl** or **@twocode.nl** on Instagram. Every message is read.
+- **Its colour** follows your agents: blue while one is working, green when it finishes, red if it hits an error. It goes back to black once you've looked.
+- **Lyrics:** close the notch from the lyrics view and it keeps showing the current line.
+- **Meetings:** five minutes before an event, it shows the name and a countdown. The × dismisses it.
+- **Headphones:** when Bluetooth headphones connect or disconnect, it pops open with their name, plus the battery level when Windows reports one.
+
+With **Allow or Deny** turned on, you can approve an agent's command or edit from the notch, with a preview of what it will run or change.
+
+## Install
+
+There's no ready-made download yet, so you build TwoCode from source. It takes about 10 minutes the first time, mostly installing Rust.
+
+1. **Install Rust** from [rustup.rs](https://rustup.rs). When the installer offers the Visual Studio C++ build tools, accept them.
+2. **Build TwoCode.** Open PowerShell and run:
+
+   ```powershell
+   git clone -b native-rust-notch https://github.com/yashc73080/TwoCode.git
+   cd TwoCode\native
+   cargo build --release
+   ```
+
+3. **Put it somewhere permanent.** The build folder is overwritten by every rebuild, so copy the app out of it:
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\TwoCode" | Out-Null
+   Copy-Item target\release\twocode.exe "$env:LOCALAPPDATA\Programs\TwoCode\"
+   ```
+
+4. **Start it** by double-clicking `twocode.exe` in `%LOCALAPPDATA%\Programs\TwoCode`. The pill appears at the top of your main screen.
+5. **Keep it running:** right-click the pill and turn on **Start with Windows**.
+
+**If Windows blocks it:** your build isn't signed, so Windows may warn about it.
+- **SmartScreen** ("Windows protected your PC"): click **More info**, then **Run anyway**.
+- **Smart App Control:** this has no per-app exception. Running `cargo build --release` again produces a new copy, which Windows sometimes allows.
+
+### Update
+
+Exit TwoCode from its settings panel, then from the `TwoCode\native` folder:
+
+```powershell
+git pull
+cargo build --release
+Copy-Item target\release\twocode.exe "$env:LOCALAPPDATA\Programs\TwoCode\" -Force
+```
+
+Start it again. Your settings, todos and shelf are kept.
+
+### Uninstall
+
+1. In the settings panel, turn off **Allow or Deny** for Claude Code and Codex if you turned them on. This removes TwoCode's hooks from their settings.
+2. Turn off **Start with Windows**, then choose **Exit TwoCode**.
+3. Delete `%LOCALAPPDATA%\Programs\TwoCode` and `%APPDATA%\TwoCode`.
+
+## Using it
+
+- **Open:** point at the pill. It closes when the mouse leaves.
+- **Switch tabs:** click the dots at the bottom, use the faint arrows on each side, or swipe sideways on a touchpad.
+- **Settings:** right-click the notch or the tray icon. Each tab and feature has its own switch there.
+
+### Claude Code and Codex
+
+Tracking works as soon as TwoCode runs: it reads the session files Claude Code and Codex already write to `~/.claude` and `~/.codex`. Agents running in the cloud or on another machine don't appear.
+
+To approve commands from the notch, turn on **Allow or Deny for Claude Code** or **for Codex** in the settings panel. That adds a hook to `~/.claude/settings.json` or `~/.codex/hooks.json`, with a backup next to the file. Codex asks you to trust the new hook once. A request you don't answer in the notch goes back to the agent's own window after 5 minutes for Claude Code, or 1 minute for Codex.
+
+### Google Calendar
+
+The Calendar tab can read your events but never change them. It needs your own Google client, which you create once:
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the **Google Calendar API**.
+2. Set up the OAuth consent screen and add yourself as a test user.
+3. Under **Credentials**, create an **OAuth client ID** of type **Desktop app** and download its JSON file.
+4. Save it as `%APPDATA%\TwoCode\google-client.json` (the tab's **Open folder** button takes you there), then press **Connect**.
+
+While your Google project is in testing mode, Google ends the sign-in after 7 days and you'll need to connect again.
 
 ## Privacy
 
-TwoCode runs on your own PC and needs no TwoCode account. The status of Claude Code and Codex is read locally and sent nowhere. When you ask Robo something, it goes to the AI you connected yourself (Claude Code or Codex), the same way as when you use it in your terminal. Links you switch on yourself (Spotify, weather, a calendar link) talk directly to that service.
+TwoCode runs on your PC with no account. It only connects to:
 
----
+- **LRCLIB:** the title, artist, album and length of the current song, when lyrics are on.
+- **Google:** to sign in and read your calendar, only if you connect it.
 
-## Nederlands: zo download je TwoCode
+Everything else stays on your PC. The waveform reads what your speakers are playing, never the microphone, and keeps only the current bar heights.
 
-1. Ga naar **[Releases](../../releases/latest)** en download **`TwoCode-Windows.zip`**.
-2. Rechtsklik op de zip → **Alles uitpakken…**
-3. Open de map `TwoCode` en dubbelklik op **`TwoCode.exe`**.
-4. Zegt Windows *"Uw pc is beveiligd"*? Klik **Meer info → Toch uitvoeren**. Dat komt omdat de app nieuw is.
+Your data lives in `%APPDATA%\TwoCode`:
 
-Claude Code of Codex koppelen: island openen → **Instellingen → AI**. Afsluiten: de **⏻-knop** rechtsboven in de island. Feedback is heel welkom via info@twocode.nl.
-
----
+| File | What's in it |
+| --- | --- |
+| `config.json` | Your settings |
+| `recent.json` | Agent runs from the last 3 hours: what you asked and which files changed |
+| `todos.json` | Your todos |
+| `shelf.json` | Paths of files on the shelf. The files themselves aren't copied |
+| `google-token.bin` | Your Google sign-in, encrypted for your Windows account |
+| `twocode.log` | Problems worth knowing about, capped at 64 KB |
 
 ## For developers
 
-Needs [Node.js](https://nodejs.org) and Windows PowerShell 5.1.
+The app is in [`native/`](native/), and [`native/README.md`](native/README.md) explains how it's built and tested. The JavaScript files in the repository root belong to the original Electron version of TwoCode, which this rebuild replaces.
 
-```powershell
-git clone https://github.com/levon-z/TwoCode.git
-cd TwoCode
-npm ci
-npm start
-```
-
-`npm test` runs the tests. `tools/make-icon.cjs` redraws the app icon.
-
-Codex support uses the optional Codex package: `npm install @openai/codex --include=optional`.
-
-Website: [twocode.nl](https://twocode.nl) · Contact: info@twocode.nl
+The AirPods icon is from [Myna UI Icons](https://github.com/praveenjuge/mynaui-icons) (MIT). Its notice is in [`native/assets/LICENSE-mynaui-icons.txt`](native/assets/LICENSE-mynaui-icons.txt).
