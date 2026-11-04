@@ -618,10 +618,11 @@ impl App {
     }
 
     /// Scrolling sideways, on a touchpad or a tilting wheel, moves between tabs.
-    /// The tabs follow your fingers: a touchpad reports a swipe to the left as scrolling right, so the sign flips.
+    /// A touchpad reports a swipe to the left as scrolling right, so following your fingers flips the sign.
     fn sideways_wheel(&mut self, delta: i32) {
         let since = self.last_sideways_step.elapsed().as_millis();
-        let (step, total) = layout::sideways(self.sideways_total, -delta, since);
+        let delta = if self.config.swipe_follows_fingers { -delta } else { delta };
+        let (step, total) = layout::sideways(self.sideways_total, delta, since);
         self.sideways_total = total;
         if let Some(forward) = step {
             self.last_sideways_step = Instant::now();

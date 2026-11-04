@@ -26,6 +26,8 @@ const TIMER_SWITCH: usize = 1;
 const SWITCH_FRAME_MS: u32 = 16;
 const SWITCH_EASE: f32 = 0.35;
 const WHEEL_STEP: f32 = 40.0;
+const SEGMENT_W: f32 = 66.0;
+const SEGMENT_H: f32 = 21.0;
 
 const PANEL: u32 = 0x18181A;
 const WHITE: u32 = 0xFFFFFF;
@@ -39,6 +41,8 @@ pub enum Row {
     Header(&'static str),
     Switch { id: usize, label: String, on: bool, enabled: bool, child: bool },
     Radio { id: usize, label: String, on: bool },
+    /// A choice between options shown side by side, one id per option.
+    Choice { ids: Vec<usize>, label: String, options: Vec<String>, chosen: usize },
     Button { id: usize, label: String, enabled: bool, danger: bool },
 }
 
@@ -54,9 +58,16 @@ impl Row {
     fn id(&self) -> Option<usize> {
         match self {
             Row::Switch { id, enabled: true, .. } | Row::Button { id, enabled: true, .. } | Row::Radio { id, .. } => Some(*id),
+            Row::Choice { ids, .. } => ids.first().copied(),
             _ => None,
         }
     }
+}
+
+/// Where each option of a choice sits in its row: a strip of equal buttons on the right.
+pub fn segments(r: Rect, count: usize) -> Vec<Rect> {
+    let left = r.x + r.w - 8.0 - SEGMENT_W * count as f32;
+    (0..count).map(|i| Rect { x: left + i as f32 * SEGMENT_W, y: r.y + (r.h - SEGMENT_H) / 2.0, w: SEGMENT_W, h: SEGMENT_H }).collect()
 }
 
 pub fn content_height(rows: &[Row]) -> f32 {
@@ -103,6 +114,8 @@ struct Menu {
 fn knob_goal(row: &Row) -> f32 {
     match row {
         Row::Switch { on: true, .. } | Row::Radio { on: true, .. } => 1.0,
+        // For a choice, the highlight's position: 0 under the first option, 1 under the second, and so on.
+        Row::Choice { chosen, .. } => *chosen as f32,
         _ => 0.0,
     }
 }
@@ -176,6 +189,17 @@ impl Menu {
         self.gfx.as_ref().map_or(1.0, |g| g.scale)
     }
 
+    /// Which option of the choice in row `i` is under the mouse, if any.
+    fn option_under(&self, i: usize, lparam: LPARAM) -> Option<usize> {
+        let Some(Row::Choice { options, .. }) = self.rows.get(i) else { return None };
+        let scale = self.scale();
+        let (x, y) = ((lparam.0 & 0xFFFF) as i16 as f32 / scale, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / scale);
+        let panel = self.panel();
+        let top = panel.y - self.scroll + TITLE_H + self.rows[..i].iter().map(Row::height).sum::<f32>();
+        let r = Rect { x: panel.x + GAP, y: top, w: panel.w - GAP * 2.0, h: ROW_H };
+        segments(r, options.len()).iter().position(|s| s.contains(x, y))
+    }
+
     fn row_under(&self, lparam: LPARAM) -> Option<usize> {
         let scale = self.scale();
         let x = (lparam.0 & 0xFFFF) as i16 as f32 / scale;
@@ -192,8 +216,14 @@ impl Menu {
         self.panel().contains((lparam.0 & 0xFFFF) as i16 as f32 / scale, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / scale)
     }
 
-    fn activate(&mut self, i: usize) {
-        let Some(id) = self.rows.get(i).and_then(Row::id) else { return };
+    /// For a choice, `option` picks one; without it, Enter moves to the next.
+    fn activate(&mut self, i: usize, option: Option<usize>) {
+        let id = match self.rows.get(i) {
+            Some(Row::Choice { ids, chosen, .. }) => ids.get(option.unwrap_or((chosen + 1) % ids.len())).copied(),
+            Some(row) => row.id(),
+            None => None,
+        };
+        let Some(id) = id else { return };
         let main = HWND(crate::WINDOW.load(std::sync::atomic::Ordering::SeqCst) as *mut _);
         let Some(app) = (unsafe { crate::app(main) }) else { return };
         if !shell::menu_choose(app, id) {
@@ -252,6 +282,18 @@ fn draw_row(g: &mut Gfx, row: &Row, knob: f32, r: Rect) {
             g.circle(cx, cy, 7.0, BLUE, knob);
             g.circle(cx, cy, 2.8, WHITE, knob);
         }
+        Row::Choice { label, options, .. } => {
+            g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 16.0 - SEGMENT_W * options.len() as f32, h: r.h }, 12.0, false, Align::Left, WHITE, 1.0);
+            let cells = segments(r, options.len());
+            let (first, last) = (cells[0], cells[cells.len() - 1]);
+            g.fill(Rect { x: first.x, y: first.y, w: last.x + last.w - first.x, h: first.h }, first.h / 2.0, WHITE, 0.08);
+            // The highlight slides between options as the choice changes.
+            g.fill(Rect { x: first.x + knob * SEGMENT_W + 2.0, y: first.y + 2.0, w: SEGMENT_W - 4.0, h: first.h - 4.0 }, (first.h - 4.0) / 2.0, BLUE, 1.0);
+            for (n, (cell, option)) in cells.iter().zip(options).enumerate() {
+                let near = 1.0 - (knob - n as f32).abs().min(1.0);
+                g.text(option, *cell, 11.0, near > 0.5, Align::Center, WHITE, 0.55 + 0.45 * near);
+            }
+        }
         Row::Button { label, enabled, danger, .. } => {
             let colour = if *danger { RED } else { WHITE };
             g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 16.0, h: r.h }, 12.0, false, Align::Left, colour, if *enabled { 1.0 } else { 0.35 });
@@ -289,7 +331,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_LBUTTONUP => match m.row_under(lparam) {
-            Some(i) => m.activate(i),
+            Some(i) => {
+                // A click on a choice's label, rather than an option, does nothing.
+                let is_choice = matches!(m.rows.get(i), Some(Row::Choice { .. }));
+                match m.option_under(i, lparam) {
+                    Some(option) => m.activate(i, Some(option)),
+                    None if !is_choice => m.activate(i, None),
+                    None => {}
+                }
+            }
             None if !m.inside(lparam) => m.close(false),
             None => {}
         },
@@ -310,7 +360,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 m.render();
             } else if key == VK_RETURN.0 || key == VK_SPACE.0 {
                 if let Some(i) = m.hover {
-                    m.activate(i);
+                    m.activate(i, None);
+                }
+            } else if key == VK_LEFT.0 || key == VK_RIGHT.0 {
+                // Left and Right pick an option of a choice directly.
+                if let Some((i, Row::Choice { options, chosen, .. })) = m.hover.and_then(|i| m.rows.get(i).map(|r| (i, r.clone()))) {
+                    let next = if key == VK_RIGHT.0 { (chosen + 1).min(options.len() - 1) } else { chosen.saturating_sub(1) };
+                    if next != chosen {
+                        m.activate(i, Some(next));
+                    }
                 }
             }
         }
@@ -445,6 +503,18 @@ mod tests {
         assert_eq!(next_row(&list, Some(1), false), Some(5));
         assert_eq!(next_row(&list, None, false), Some(5));
         assert_eq!(next_row(&[Row::Header("x")], None, true), None);
+    }
+
+    #[test]
+    fn choice_options_sit_side_by_side_on_the_right() {
+        let row = Rect { x: 0.0, y: 100.0, w: 284.0, h: ROW_H };
+        let cells = segments(row, 2);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1].x + cells[1].w, 284.0 - 8.0);
+        assert_eq!(cells[1].x, cells[0].x + SEGMENT_W);
+        assert!(cells[0].contains(cells[0].x + 1.0, 110.0) && !cells[1].contains(cells[0].x + 1.0, 110.0));
+        let choice = Row::Choice { ids: vec![7, 8], label: "x".into(), options: vec!["a".into(), "b".into()], chosen: 1 };
+        assert_eq!((choice.id(), knob_goal(&choice)), (Some(7), 1.0));
     }
 
     #[test]

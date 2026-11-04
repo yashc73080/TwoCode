@@ -11,7 +11,7 @@ cargo test
 cargo build --release
 ```
 
-The app is `target/release/twocode.exe`. Right-click the notch or its tray icon for the settings panel. Move between tabs with the arrows at the ends of the tab row, by scrolling sideways, or by scrolling over the tab row.
+The app is `target/release/twocode.exe`. Right-click the notch or its tray icon for the settings panel. Move between tabs with the arrows at the ends of the tab row, by scrolling sideways, or by scrolling over the tab row. **Swipe direction** in the settings panel sets which way a sideways swipe goes: **Natural** moves with your fingers, and **Reversed** moves the other way.
 
 ## How it works
 

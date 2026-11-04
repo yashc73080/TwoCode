@@ -22,13 +22,15 @@ pub struct Config {
     pub todos: bool,
     pub shelf: bool,
     pub bluetooth: bool,
+    /// Swiping left goes to the tab on the left. Off reverses it.
+    pub swipe_follows_fingers: bool,
     /// Windows' name for the chosen display. Empty or gone means the main one.
     pub display: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_popup: false, hide_fullscreen: true, tab: Tab::Media, sounds: false, recent: true, calendar: true, todos: true, shelf: true, bluetooth: true, display: String::new() }
+        Config { media: true, lyrics: true, agents: true, track_claude: true, track_codex: true, finish_popup: false, hide_fullscreen: true, tab: Tab::Media, sounds: false, recent: true, calendar: true, todos: true, shelf: true, bluetooth: true, swipe_follows_fingers: true, display: String::new() }
     }
 }
 

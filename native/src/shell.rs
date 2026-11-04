@@ -77,6 +77,8 @@ const ID_TODOS: usize = 16;
 const ID_SHELF: usize = 17;
 const ID_DISCONNECT: usize = 18;
 const ID_BLUETOOTH: usize = 19;
+const ID_SWIPE_NATURAL: usize = 20;
+const ID_SWIPE_REVERSED: usize = 21;
 const ID_DISPLAY_FIRST: usize = 100;
 
 /// What the settings panel shows right now.
@@ -115,6 +117,12 @@ pub fn menu_rows(app: &App) -> Vec<Row> {
     rows.push(Row::Header("General"));
     rows.push(switch(ID_SOUNDS, "Sounds", c.sounds, true, false));
     rows.push(switch(ID_BLUETOOTH, "Show headphones connecting", c.bluetooth, true, false));
+    rows.push(Row::Choice {
+        ids: vec![ID_SWIPE_NATURAL, ID_SWIPE_REVERSED],
+        label: "Swipe direction".to_string(),
+        options: vec!["Natural".to_string(), "Reversed".to_string()],
+        chosen: if c.swipe_follows_fingers { 0 } else { 1 },
+    });
     rows.push(switch(ID_FULLSCREEN, "Hide in full screen", c.hide_fullscreen, true, false));
     rows.push(switch(ID_STARTUP, "Start with Windows", starts_with_windows(), true, false));
     rows.push(Row::Button { id: ID_EXIT, label: "Exit TwoCode".to_string(), enabled: true, danger: true });
@@ -152,6 +160,8 @@ fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {
         ID_TODOS => c.todos = !c.todos,
         ID_SHELF => c.shelf = !c.shelf,
         ID_BLUETOOTH => c.bluetooth = !c.bluetooth,
+        ID_SWIPE_NATURAL => c.swipe_follows_fingers = true,
+        ID_SWIPE_REVERSED => c.swipe_follows_fingers = false,
         ID_DISCONNECT => {
             let _ = app.calendar_tx.send(crate::calendar::Command::Disconnect);
             return;
