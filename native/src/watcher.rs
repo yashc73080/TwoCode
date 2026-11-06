@@ -74,7 +74,7 @@ pub fn start(hub: Arc<Mutex<Hub>>, on_change: impl Fn() + Send + 'static) {
                 for path in noticed.drain(..) {
                     if let Some((agent, _)) = roots.iter().find(|(_, root)| path.starts_with(root)) {
                         let helper = path.components().any(|c| c.as_os_str() == "subagents");
-                        if !helper && path.extension().is_some_and(|e| e == "jsonl") {
+                        if !helper && !remote_copy(&path) && path.extension().is_some_and(|e| e == "jsonl") {
                             read(*agent, &path, None, &mut active);
                         }
                     }
@@ -113,11 +113,20 @@ fn collect(dir: &Path, out: &mut Vec<(PathBuf, u64)>, depth: u32) {
             if depth < 5 && entry.file_name() != "subagents" {
                 collect(&path, out, depth + 1);
             }
-        } else if path.extension().is_some_and(|e| e == "jsonl") {
+        } else if path.extension().is_some_and(|e| e == "jsonl") && !remote_copy(&path) {
             let len = entry.metadata().map_or(0, |m| m.len());
             out.push((path, len));
         }
     }
+}
+
+/// The desktop app keeps a delayed copy of each SSH session in projects/ssh-<id>/, its helpers beside it.
+/// Helpers are skipped, and so is the copy of a session that is followed live over SSH.
+fn remote_copy(path: &Path) -> bool {
+    let Some(dir) = path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()) else { return false };
+    let Some(id) = dir.strip_prefix("ssh-") else { return false };
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    stem != id || crate::remote::is_followed(id)
 }
 
 fn session_id(agent: Agent, path: &Path) -> String {
@@ -183,8 +192,8 @@ fn read_new(agent: Agent, path: &Path, tails: &mut HashMap<PathBuf, Tail>, hub: 
     changed
 }
 
-/// Exposed for the tests: one transcript line into the hub.
-fn apply_line(agent: Agent, id: &str, line: &str, now: u64, hub: &mut Hub) -> bool {
+/// One transcript line into the hub. The SSH follower feeds remote lines through here too.
+pub fn apply_line(agent: Agent, id: &str, line: &str, now: u64, hub: &mut Hub) -> bool {
     let events = match agent {
         Agent::Claude => agents::parse_claude(line),
         Agent::Codex => agents::parse_codex(line),

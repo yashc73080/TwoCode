@@ -11,6 +11,7 @@ mod layout;
 mod lyrics;
 mod media;
 mod menu;
+mod remote;
 mod shelf;
 mod shell;
 mod todos;
@@ -1145,6 +1146,7 @@ fn main() {
         let secret = hooks::token(&config::dir());
         hooks::serve(hub.clone(), secret.clone(), tell_window);
         watcher::start(hub.clone(), tell_window);
+        remote::start(hub.clone(), tell_window);
         let media_tx = media::start(media_state.clone(), tell_window);
         let lyrics_store = Arc::new(Mutex::new(lyrics::Store::default()));
         let lyrics_tx = lyrics::start(lyrics_store.clone(), tell_window);
