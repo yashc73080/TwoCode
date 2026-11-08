@@ -6,6 +6,7 @@ mod bluetooth;
 mod calendar;
 mod config;
 mod gfx;
+mod glow;
 mod hooks;
 mod layout;
 mod lyrics;
@@ -51,6 +52,8 @@ const TIMER_RETRY: usize = 6;
 const TIMER_WAVE: usize = 7;
 const TIMER_REMINDER: usize = 8;
 const TIMER_TRIM: usize = 9;
+const TIMER_GLOW: usize = 10;
+const GLOW_FRAME_MS: u32 = 16;
 const TRIM_AFTER_MS: u32 = 30_000;
 const REMINDER_CHECK_MS: u32 = 15_000;
 const WAVE_FRAME_MS: u32 = 33;
@@ -139,6 +142,10 @@ pub struct App {
     tab_reveal: f32,
     tab_position: f32,
     tabs_clock: Instant,
+    glow: glow::Glow,
+    glow_running: bool,
+    /// Which of your own glow colors the wheel in the settings is changing.
+    pub glow_stop: usize,
     dirty: bool,
     pub tray_message: u32,
 }
@@ -352,7 +359,9 @@ impl App {
         if next == Mode::Open && self.hovering {
             self.opened_by_hover = true;
         }
-        self.listen_to_audio(next == Mode::Open && self.config.tab == Tab::Media && self.config.media && !self.hidden_for_fullscreen);
+        let page_wave = next == Mode::Open && self.config.tab == Tab::Media && self.config.media;
+        let glow_wave = self.glow_shows() && self.config.glow_motion == glow::Motion::Music && self.media.playing;
+        self.listen_to_audio((page_wave || glow_wave) && !self.hidden_for_fullscreen);
         if next == Mode::Open && self.mode != Mode::Open && self.config.tab == Tab::Calendar {
             let _ = self.calendar_tx.send(calendar::Command::Refresh);
         }
@@ -383,6 +392,7 @@ impl App {
             self.last_frame = Instant::now();
         }
         self.ask_for_lyrics();
+        self.update_glow();
         unsafe {
             if self.hidden_for_fullscreen {
                 // Nothing on screen needs the time. Other threads still report what happens.
@@ -401,6 +411,26 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    /// The glow is on, and there is a reason to show it right now.
+    fn glow_shows(&self) -> bool {
+        let playing = self.media.present && self.media.playing;
+        self.config.glow && !self.hidden_for_fullscreen && (!self.config.glow_only_playing || playing)
+    }
+
+    pub fn update_glow(&mut self) {
+        let c = &self.config;
+        let custom = c.glow_custom[..(c.glow_custom_count.clamp(1, 3) as usize)].to_vec();
+        let settings = glow::Settings { palette: c.glow_palette, custom, style: c.glow_style, motion: c.glow_motion, size: c.glow_size, strength: c.glow_strength };
+        self.glow.set_art(self.media.art_rev, self.media.art.as_deref().map(|v| v.as_slice()));
+        let area = shell::display_rect(&c.display);
+        if self.glow.update(settings, self.glow_shows(), area, self.hwnd) && !self.glow_running {
+            self.glow_running = true;
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_GLOW, GLOW_FRAME_MS, None);
+            }
+        }
     }
 
     fn lyrics_view_showing(&self) -> bool {
@@ -711,6 +741,7 @@ impl App {
             tab: self.config.tab,
             media: &self.media,
             lyrics_on: self.config.lyrics,
+            glow_on: self.config.glow,
             lyric_lines: &self.lyric_lines,
             selected: self.selected.as_ref().and_then(|(agent, id)| self.sessions.iter().find(|s| s.agent == *agent && s.id == *id)),
             selected_run: self.selected_run.and_then(|at| runs.iter().find(|r| r.at_ms == at).copied()),
@@ -762,7 +793,7 @@ impl App {
         self.tab_reveal != reveal || self.tab_position != position
     }
 
-    /// Creates the surface at this display's scale and puts the window at the top centre of the main screen.
+    /// Creates the surface at this display's scale and puts the window at the top center of the main screen.
     pub fn recreate_graphics(&mut self) {
         self.gfx = None;
         let area = shell::display_rect(&self.config.display);
@@ -948,6 +979,11 @@ impl App {
                 self.settle();
             }
             Some(Action::SeekTo(ms)) => drop(self.media_tx.send(Command::Seek(ms))),
+            Some(Action::ToggleGlow) => {
+                self.config.glow = !self.config.glow;
+                self.config.save();
+                self.settle();
+            }
             Some(Action::ToggleLyrics) => {
                 self.config.lyrics = !self.config.lyrics;
                 self.config.save();
@@ -982,7 +1018,7 @@ impl App {
 
     fn timer(&mut self, id: usize) {
         unsafe {
-            if id != TIMER_TICK && id != TIMER_FULLSCREEN && id != TIMER_WAVE && id != TIMER_REMINDER {
+            if id != TIMER_TICK && id != TIMER_FULLSCREEN && id != TIMER_WAVE && id != TIMER_REMINDER && id != TIMER_GLOW {
                 let _ = KillTimer(Some(self.hwnd), id);
             }
         }
@@ -1010,7 +1046,18 @@ impl App {
                 let levels = self.wave_state.lock().map_or([0.0; audio::BARS], |w| *w);
                 if levels != self.wave {
                     self.wave = levels;
-                    self.dirty = true;
+                    // The glow may be listening while the notch is closed: only a visible waveform needs a frame.
+                    if self.mode == Mode::Open && self.config.tab == Tab::Media {
+                        self.dirty = true;
+                    }
+                }
+            }
+            TIMER_GLOW => {
+                if !self.glow.frame(&self.wave) {
+                    self.glow_running = false;
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), TIMER_GLOW);
+                    }
                 }
             }
             // Startup and a closed notch leave pages that nothing touches until it opens again. Hand them back.
@@ -1097,7 +1144,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             SetCursor(Some(cursor));
             return LRESULT(1);
         }
-        WM_DPICHANGED | WM_DISPLAYCHANGE => app.recreate_graphics(),
+        WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            app.recreate_graphics();
+            app.settle(); // the glow follows the display's new size
+        }
         shell::WM_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
@@ -1224,6 +1274,9 @@ fn main() {
             tab_reveal: 0.0,
             tab_position: 0.0,
             tabs_clock: Instant::now(),
+            glow: glow::Glow::new(),
+            glow_running: false,
+            glow_stop: 0,
             dirty: true,
             tray_message: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));

@@ -35,6 +35,7 @@ pub enum Action {
     Toggle,
     Next,
     ToggleLyrics,
+    ToggleGlow,
     Seek { x: f32, w: f32, duration_ms: u64 },
     SeekTo(u64),
     Allow(Agent, String),
@@ -69,6 +70,7 @@ pub struct Scene<'a> {
     pub tab: Tab,
     pub media: &'a Media,
     pub lyrics_on: bool,
+    pub glow_on: bool,
     pub lyric_lines: &'a [Line],
     pub sessions: &'a [SessionView],
     pub selected: Option<&'a SessionView>,
@@ -94,7 +96,7 @@ pub struct Scene<'a> {
     pub hovered: Option<&'a Action>,
 }
 
-fn status_colour(status: Status) -> u32 {
+fn status_color(status: Status) -> u32 {
     match status {
         Status::Waiting => AMBER,
         Status::Error => RED,
@@ -189,7 +191,7 @@ fn draw_headphones(g: &mut Gfx, cx: f32, cy: f32, hex: u32, alpha: f32) {
 
 fn draw_peek(g: &mut Gfx, s: &Scene, a: Rect) {
     let Some(text) = s.peek else { return };
-    g.circle(a.x + 20.0, a.h / 2.0, 4.0, status_colour(s.peek_status), 1.0);
+    g.circle(a.x + 20.0, a.h / 2.0, 4.0, status_color(s.peek_status), 1.0);
     g.text(text, Rect { x: a.x + 32.0, y: 0.0, w: a.w - 46.0, h: a.h }, 12.0, true, Align::Left, WHITE, 1.0);
 }
 
@@ -206,7 +208,7 @@ fn draw_reminder(g: &mut Gfx, s: &Scene, text: &str, a: Rect, hits: &mut Vec<(Re
     hits.push((close, Action::DismissReminder));
 }
 
-/// The line being sung. The pill's colour is hidden behind this, so agent news shows as a small dot.
+/// The line being sung. The pill's color is hidden behind this, so agent news shows as a small dot.
 fn draw_lyric_strip(g: &mut Gfx, s: &Scene, a: Rect) {
     let dot = match s.pill {
         Pill::Working => Some(BLUE),
@@ -265,7 +267,7 @@ fn draw_tab_picker(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(
         // A dot is hidden under the marker when its tab is chosen, so only the others show.
         let closeness = (s.tab_position - i as f32).abs().min(1.0);
         match status {
-            Some(status) => g.circle(x, cy, 2.75, status_colour(status), (1.0 - s.tab_reveal) * alpha),
+            Some(status) => g.circle(x, cy, 2.75, status_color(status), (1.0 - s.tab_reveal) * alpha),
             None => g.circle(x, cy, 2.75, WHITE, 0.4 * closeness * (1.0 - s.tab_reveal) * alpha),
         }
         if s.tab_reveal > 0.01 {
@@ -274,7 +276,7 @@ fn draw_tab_picker(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(
             draw_tab_icon(g, *tab, x, cy + 0.5, shade * s.tab_reveal * alpha);
             g.unscaled();
             if let Some(status) = status {
-                g.circle(x + 8.0, cy - 6.0, 2.5, status_colour(status), s.tab_reveal * alpha);
+                g.circle(x + 8.0, cy - 6.0, 2.5, status_color(status), s.tab_reveal * alpha);
             }
         }
         // The same targets throughout, so the row can't flicker as it moves.
@@ -410,6 +412,13 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
     let shade = if s.lyrics_on { 1.0 } else { 0.45 };
     draw_bubble(g, bubble.x + 14.0, cy, shade * alpha);
     hits.push((bubble, Action::ToggleLyrics));
+    // The screen glow's switch mirrors the lyrics button on the right.
+    let lamp = Rect { x: x + w - 26.0, y: cy - 14.0, w: 28.0, h: 28.0 };
+    if is_hovered(s, &Action::ToggleGlow) {
+        g.fill(lamp, 14.0, WHITE, 0.12 * alpha);
+    }
+    draw_glow_icon(g, lamp.x + 14.0, cy, if s.glow_on { 1.0 } else { 0.45 } * alpha);
+    hits.push((lamp, Action::ToggleGlow));
     for (offset, action) in [(-40.0, Action::Previous), (0.0, Action::Toggle), (40.0, Action::Next)] {
         let box_r = Rect { x: cx + offset - 14.0, y: cy - 14.0, w: 28.0, h: 28.0 };
         if is_hovered(s, &action) {
@@ -426,12 +435,33 @@ fn draw_music(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect,
     }
 }
 
+/// A small sun: a dot with eight rays.
+fn draw_glow_icon(g: &mut Gfx, cx: f32, cy: f32, alpha: f32) {
+    g.circle(cx, cy, 3.4, WHITE, alpha);
+    for k in 0..8 {
+        let angle = k as f32 * std::f32::consts::FRAC_PI_4;
+        let (dx, dy) = (angle.cos(), angle.sin());
+        let (nx, ny) = (-dy * 0.75, dx * 0.75);
+        let (near, far) = (5.6, 8.2);
+        g.polygon(
+            &[
+                (cx + dx * near + nx, cy + dy * near + ny),
+                (cx + dx * far + nx, cy + dy * far + ny),
+                (cx + dx * far - nx, cy + dy * far - ny),
+                (cx + dx * near - nx, cy + dy * near - ny),
+            ],
+            WHITE,
+            alpha,
+        );
+    }
+}
+
 /// A speech bubble as one outline, tail included, so its parts never show as separate shapes.
 fn bubble_outline(x: f32, y: f32) -> Vec<(f32, f32)> {
     const STEPS: usize = 6;
     let (left, right, top, bottom, r) = (x - 8.5, x + 8.5, y - 7.0, y + 4.5, 4.0);
     let mut points = vec![];
-    // Clockwise from the top left: each corner is an arc around its centre, starting at this angle.
+    // Clockwise from the top left: each corner is an arc around its center, starting at this angle.
     for (cx, cy, start) in [(left + r, top + r, 180.0f32), (right - r, top + r, 270.0), (right - r, bottom - r, 0.0)] {
         for step in 0..=STEPS {
             let angle = (start + 90.0 * step as f32 / STEPS as f32).to_radians();
@@ -526,11 +556,11 @@ fn brand(agent: Agent) -> (&'static str, u32) {
     }
 }
 
-fn state_colour(v: &SessionView) -> u32 {
+fn state_color(v: &SessionView) -> u32 {
     if v.is_quiet() {
         AMBER
     } else {
-        status_colour(v.status)
+        status_color(v.status)
     }
 }
 
@@ -585,11 +615,11 @@ fn draw_list(g: &mut Gfx, s: &Scene, a: Rect, alpha: f32, hits: &mut Vec<(Rect, 
     }
     hits.push((main, action));
     let (name, tint) = brand(v.agent);
-    g.circle(x + 4.0, 17.0, 4.0, state_colour(v), alpha);
+    g.circle(x + 4.0, 17.0, 4.0, state_color(v), alpha);
     g.text(name, Rect { x: x + 14.0, y: 8.0, w: 44.0, h: 18.0 }, 11.5, true, Align::Left, tint, alpha);
     let status = if v.elapsed_s > 0 { format!("{} · {}", v.status_text(), layout::elapsed(v.elapsed_s)) } else { v.status_text() };
     g.text(&v.project, Rect { x: x + 58.0, y: 8.0, w: w - 58.0 - 136.0, h: 18.0 }, 12.0, true, Align::Left, WHITE, alpha);
-    g.text(&status, Rect { x: x + w - 136.0, y: 8.0, w: 136.0, h: 18.0 }, 11.0, true, Align::Right, state_colour(v), alpha);
+    g.text(&status, Rect { x: x + w - 136.0, y: 8.0, w: 136.0, h: 18.0 }, 11.0, true, Align::Right, state_color(v), alpha);
     g.text(&v.prompt, Rect { x, y: 26.0, w, h: 16.0 }, 11.0, false, Align::Left, MUTED, alpha);
     let finished = v.status == Status::Done;
     let headline = if finished { v.summary() } else { v.progress_line().unwrap_or_else(|| v.detail.clone()) };
@@ -640,10 +670,10 @@ fn draw_small_row(g: &mut Gfx, s: &Scene, v: &SessionView, r: Rect, alpha: f32, 
         g.fill(r, 8.0, WHITE, 0.08 * alpha);
     }
     let (name, tint) = brand(v.agent);
-    g.circle(r.x + 14.0, r.y + 9.0, 3.0, state_colour(v), alpha);
+    g.circle(r.x + 14.0, r.y + 9.0, 3.0, state_color(v), alpha);
     g.text(name, Rect { x: r.x + 24.0, y: r.y, w: 42.0, h: r.h }, 10.5, true, Align::Left, tint, alpha);
     g.text(&v.project, Rect { x: r.x + 66.0, y: r.y, w: r.w - 66.0 - 122.0, h: r.h }, 11.0, false, Align::Left, WHITE, alpha);
-    g.text(&v.status_text(), Rect { x: r.x + r.w - 118.0, y: r.y, w: 108.0, h: r.h }, 10.5, true, Align::Right, state_colour(v), alpha);
+    g.text(&v.status_text(), Rect { x: r.x + r.w - 118.0, y: r.y, w: 108.0, h: r.h }, 10.5, true, Align::Right, state_color(v), alpha);
     hits.push((r, action));
 }
 
@@ -852,7 +882,7 @@ fn draw_session(g: &mut Gfx, s: &Scene, v: &SessionView, a: Rect, alpha: f32, hi
     hits.push((open_r, jump));
     let status_x = x + w - open_w - 8.0 - status_w;
     g.text(&v.project, Rect { x: x + 68.0, y: 8.0, w: status_x - x - 68.0, h: 20.0 }, 12.5, true, Align::Left, WHITE, alpha);
-    g.text(&status, Rect { x: status_x, y: 8.0, w: status_w, h: 20.0 }, 11.0, true, Align::Right, state_colour(v), alpha);
+    g.text(&status, Rect { x: status_x, y: 8.0, w: status_w, h: 20.0 }, 11.0, true, Align::Right, state_color(v), alpha);
 
     if v.can_decide {
         g.text(&v.approval.title, Rect { x, y: 32.0, w, h: 15.0 }, 10.5, false, Align::Left, FAINT, alpha);

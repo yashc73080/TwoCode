@@ -1,5 +1,6 @@
 //! The Windows parts around the notch: tray icon, the switches menu, start with Windows, full-screen detection.
 use crate::agents::Agent;
+use crate::glow::{Motion, Palette, Style};
 use crate::hooks;
 use crate::menu::Row;
 use crate::App;
@@ -79,6 +80,19 @@ const ID_DISCONNECT: usize = 18;
 const ID_BLUETOOTH: usize = 19;
 const ID_SWIPE_NATURAL: usize = 20;
 const ID_SWIPE_REVERSED: usize = 21;
+const ID_GLOW: usize = 22;
+const ID_GLOW_PLAYING: usize = 23;
+const ID_GLOW_STILL: usize = 24;
+const ID_GLOW_DRIFT: usize = 25;
+const ID_GLOW_MUSIC: usize = 26;
+const ID_GLOW_SIZE_FIRST: usize = 30; // to 32
+const ID_GLOW_STRENGTH_FIRST: usize = 40; // to 42
+const ID_GLOW_PALETTE_FIRST: usize = 50; // one per palette
+const ID_GLOW_STYLE_FIRST: usize = 60; // to 62
+const ID_GLOW_COUNT_FIRST: usize = 64; // to 66
+const ID_GLOW_STOP_FIRST: usize = 70; // to 72
+const ID_GLOW_WHEEL: usize = 75;
+const STYLES: [Style; 3] = [Style::Around, Style::Mirror, Style::Fade];
 const ID_DISPLAY_FIRST: usize = 100;
 
 /// What the settings panel shows right now.
@@ -89,6 +103,48 @@ pub fn menu_rows(app: &App) -> Vec<Row> {
         Row::Header("Media"),
         switch(ID_MEDIA, "Media player", c.media, true, false),
         switch(ID_LYRICS, "Lyrics", c.lyrics, c.media, true),
+    ];
+    rows.push(Row::Header("Screen glow"));
+    rows.push(switch(ID_GLOW, "Glow around the screen", c.glow, true, false));
+    rows.push(switch(ID_GLOW_PLAYING, "Only while music plays", c.glow_only_playing, c.glow, true));
+    let count = c.glow_custom_count.clamp(1, 3) as usize;
+    let custom = c.glow_custom[..count].to_vec();
+    let three = |a: &str, b: &str, c: &str| vec![a.to_string(), b.to_string(), c.to_string()];
+    for (n, palette) in Palette::ALL.iter().enumerate() {
+        let colors = match palette {
+            Palette::Album => app.glow.album_colors(),
+            Palette::Custom => custom.clone(),
+            preset => preset.colors().map(|c| c.to_vec()).unwrap_or_default(),
+        };
+        rows.push(Row::Radio { id: ID_GLOW_PALETTE_FIRST + n, label: palette.name().to_string(), on: c.glow_palette == *palette, colors });
+    }
+    if c.glow_palette == Palette::Custom {
+        rows.push(Row::Choice { ids: (0..3).map(|n| ID_GLOW_COUNT_FIRST + n).collect(), label: "Colors".to_string(), options: three("One", "Two", "Three"), chosen: count - 1 });
+        let editing = app.glow_stop.min(count - 1);
+        if count > 1 {
+            rows.push(Row::Swatches { ids: (0..count).map(|n| ID_GLOW_STOP_FIRST + n).collect(), label: "Color to change".to_string(), colors: custom.clone(), chosen: editing });
+        }
+        rows.push(Row::Wheel { id: ID_GLOW_WHEEL, color: custom[editing] });
+    }
+    rows.push(Row::Choice {
+        ids: (0..3).map(|n| ID_GLOW_STYLE_FIRST + n).collect(),
+        label: "Gradient".to_string(),
+        options: three("Around", "Mirror", "Fade"),
+        chosen: STYLES.iter().position(|s| *s == c.glow_style).unwrap_or(0),
+    });
+    rows.push(Row::Choice {
+        ids: vec![ID_GLOW_STILL, ID_GLOW_DRIFT, ID_GLOW_MUSIC],
+        label: "Motion".to_string(),
+        options: three("Still", "Drift", "Music"),
+        chosen: match c.glow_motion {
+            Motion::Still => 0,
+            Motion::Drift => 1,
+            Motion::Music => 2,
+        },
+    });
+    rows.push(Row::Choice { ids: (0..3).map(|n| ID_GLOW_SIZE_FIRST + n).collect(), label: "Size".to_string(), options: three("Thin", "Medium", "Thick"), chosen: c.glow_size.min(2) as usize });
+    rows.push(Row::Choice { ids: (0..3).map(|n| ID_GLOW_STRENGTH_FIRST + n).collect(), label: "Glow".to_string(), options: three("Soft", "Medium", "Bright"), chosen: c.glow_strength.min(2) as usize });
+    rows.extend([
         Row::Header("Agents"),
         switch(ID_AGENTS, "Agent tracker", c.agents, true, false),
         switch(ID_CLAUDE, "Follow Claude Code", c.track_claude, c.agents, true),
@@ -99,7 +155,7 @@ pub fn menu_rows(app: &App) -> Vec<Row> {
         switch(ID_ALLOW_CODEX, "Allow or Deny for Codex", hooks::codex_installed(&app.secret), c.agents, true),
         Row::Header("Tabs"),
         switch(ID_CALENDAR, "Calendar", c.calendar, true, false),
-    ];
+    ]);
     if crate::calendar::connected() {
         rows.push(Row::Button { id: ID_DISCONNECT, label: "Disconnect Google Calendar".to_string(), enabled: true, danger: false });
     }
@@ -111,7 +167,7 @@ pub fn menu_rows(app: &App) -> Vec<Row> {
         let chosen = displays.iter().position(|d| d.name == c.display).or_else(|| displays.iter().position(|d| d.primary));
         for (n, d) in displays.iter().enumerate() {
             let label = format!("Display {} ({} x {}){}", n + 1, d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, if d.primary { ", main" } else { "" });
-            rows.push(Row::Radio { id: ID_DISPLAY_FIRST + n, label, on: chosen == Some(n) });
+            rows.push(Row::Radio { id: ID_DISPLAY_FIRST + n, label, on: chosen == Some(n), colors: vec![] });
         }
     }
     rows.push(Row::Header("General"));
@@ -162,6 +218,24 @@ fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {
         ID_BLUETOOTH => c.bluetooth = !c.bluetooth,
         ID_SWIPE_NATURAL => c.swipe_follows_fingers = true,
         ID_SWIPE_REVERSED => c.swipe_follows_fingers = false,
+        ID_GLOW => c.glow = !c.glow,
+        ID_GLOW_PLAYING => c.glow_only_playing = !c.glow_only_playing,
+        ID_GLOW_STILL => c.glow_motion = Motion::Still,
+        ID_GLOW_DRIFT => c.glow_motion = Motion::Drift,
+        ID_GLOW_MUSIC => c.glow_motion = Motion::Music,
+        n if (ID_GLOW_SIZE_FIRST..ID_GLOW_SIZE_FIRST + 3).contains(&n) => c.glow_size = (n - ID_GLOW_SIZE_FIRST) as u8,
+        n if (ID_GLOW_STRENGTH_FIRST..ID_GLOW_STRENGTH_FIRST + 3).contains(&n) => c.glow_strength = (n - ID_GLOW_STRENGTH_FIRST) as u8,
+        n if (ID_GLOW_PALETTE_FIRST..ID_GLOW_PALETTE_FIRST + Palette::ALL.len()).contains(&n) => c.glow_palette = Palette::ALL[n - ID_GLOW_PALETTE_FIRST],
+        n if (ID_GLOW_STYLE_FIRST..ID_GLOW_STYLE_FIRST + 3).contains(&n) => c.glow_style = STYLES[n - ID_GLOW_STYLE_FIRST],
+        n if (ID_GLOW_COUNT_FIRST..ID_GLOW_COUNT_FIRST + 3).contains(&n) => {
+            c.glow_custom_count = (n - ID_GLOW_COUNT_FIRST + 1) as u8;
+            // A color just added is the one you will want to change next.
+            app.glow_stop = n - ID_GLOW_COUNT_FIRST;
+        }
+        n if (ID_GLOW_STOP_FIRST..ID_GLOW_STOP_FIRST + 3).contains(&n) => {
+            app.glow_stop = n - ID_GLOW_STOP_FIRST;
+            return;
+        }
         ID_DISCONNECT => {
             let _ = app.calendar_tx.send(crate::calendar::Command::Disconnect);
             return;
@@ -191,6 +265,17 @@ fn choose(app: &mut App, id: usize, allow_on: bool, allow_codex_on: bool) {
     app.config.save();
     app.settle();
     crate::tell_window();
+}
+
+/// Sets the glow color the wheel is changing, and switches the glow to your own colors.
+pub fn set_glow_color(app: &mut App, color: u32, save: bool) {
+    let editing = app.glow_stop.min(app.config.glow_custom_count.clamp(1, 3) as usize - 1);
+    app.config.glow_custom[editing] = color;
+    app.config.glow_palette = Palette::Custom;
+    if save {
+        app.config.save();
+    }
+    app.update_glow();
 }
 
 fn show_error(text: &str) {

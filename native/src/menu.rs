@@ -1,5 +1,6 @@
 //! The settings panel you get from right-clicking the notch or its tray icon: its own small window, drawn like the notch.
 use crate::gfx::{Align, Gfx, Rect};
+use crate::glow::{from_hsv, hex, hsv, rgb};
 use crate::shell;
 use crate::App;
 use std::sync::Once;
@@ -28,6 +29,12 @@ const SWITCH_EASE: f32 = 0.35;
 const WHEEL_STEP: f32 = 40.0;
 const SEGMENT_W: f32 = 66.0;
 const SEGMENT_H: f32 = 21.0;
+const WHEEL_H: f32 = 148.0;
+const WHEEL_R: f32 = 60.0;
+const SWATCH_W: f32 = 30.0;
+/// How dark the brightness slider lets a color go: any darker and the glow is not there at all.
+const DARKEST: f32 = 0.15;
+const HUE_STEP: f32 = 12.0;
 
 const PANEL: u32 = 0x18181A;
 const WHITE: u32 = 0xFFFFFF;
@@ -40,25 +47,30 @@ const RED: u32 = 0xF87171;
 pub enum Row {
     Header(&'static str),
     Switch { id: usize, label: String, on: bool, enabled: bool, child: bool },
-    Radio { id: usize, label: String, on: bool },
+    /// One of a list; `colors`, when there are any, are shown as a small strip beside it.
+    Radio { id: usize, label: String, on: bool, colors: Vec<u32> },
     /// A choice between options shown side by side, one id per option.
     Choice { ids: Vec<usize>, label: String, options: Vec<String>, chosen: usize },
+    /// Like a choice, but the options are colors shown as dots.
+    Swatches { ids: Vec<usize>, label: String, colors: Vec<u32>, chosen: usize },
+    /// A color wheel with a brightness slider, changed by dragging.
+    Wheel { id: usize, color: u32 },
     Button { id: usize, label: String, enabled: bool, danger: bool },
 }
 
 impl Row {
     fn height(&self) -> f32 {
-        if matches!(self, Row::Header(_)) {
-            HEADER_H
-        } else {
-            ROW_H
+        match self {
+            Row::Header(_) => HEADER_H,
+            Row::Wheel { .. } => WHEEL_H,
+            _ => ROW_H,
         }
     }
 
     fn id(&self) -> Option<usize> {
         match self {
-            Row::Switch { id, enabled: true, .. } | Row::Button { id, enabled: true, .. } | Row::Radio { id, .. } => Some(*id),
-            Row::Choice { ids, .. } => ids.first().copied(),
+            Row::Switch { id, enabled: true, .. } | Row::Button { id, enabled: true, .. } | Row::Radio { id, .. } | Row::Wheel { id, .. } => Some(*id),
+            Row::Choice { ids, .. } | Row::Swatches { ids, .. } => ids.first().copied(),
             _ => None,
         }
     }
@@ -68,6 +80,60 @@ impl Row {
 pub fn segments(r: Rect, count: usize) -> Vec<Rect> {
     let left = r.x + r.w - 8.0 - SEGMENT_W * count as f32;
     (0..count).map(|i| Rect { x: left + i as f32 * SEGMENT_W, y: r.y + (r.h - SEGMENT_H) / 2.0, w: SEGMENT_W, h: SEGMENT_H }).collect()
+}
+
+/// Where each color of a row of swatches sits: dots on the right.
+pub fn swatch_cells(r: Rect, count: usize) -> Vec<Rect> {
+    let left = r.x + r.w - 4.0 - SWATCH_W * count as f32;
+    (0..count).map(|i| Rect { x: left + i as f32 * SWATCH_W, y: r.y, w: SWATCH_W, h: r.h }).collect()
+}
+
+/// The parts of a row that can be clicked one by one, if it has any.
+fn cells(row: &Row, r: Rect) -> Vec<Rect> {
+    match row {
+        Row::Choice { options, .. } => segments(r, options.len()),
+        Row::Swatches { colors, .. } => swatch_cells(r, colors.len()),
+        _ => vec![],
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Part {
+    /// The disc, for the color itself.
+    Disc,
+    /// The bar beside it, for how bright.
+    Bright,
+}
+
+/// Where the parts of a color wheel row go: the disc's center, then the slider and the sample of the color.
+pub fn wheel_parts(r: Rect) -> ((f32, f32), Rect, Rect) {
+    let center = (r.x + 14.0 + WHEEL_R, r.y + r.h / 2.0);
+    let slider = Rect { x: center.0 + WHEEL_R + 18.0, y: center.1 - WHEEL_R, w: 14.0, h: WHEEL_R * 2.0 };
+    let left = slider.x + slider.w + 18.0;
+    let sample = Rect { x: left, y: center.1 - 34.0, w: r.x + r.w - 8.0 - left, h: 44.0 };
+    (center, slider, sample)
+}
+
+/// Which part of the wheel row a press lands on, with a little room around each.
+pub fn wheel_part(r: Rect, x: f32, y: f32) -> Option<Part> {
+    let ((cx, cy), slider, _) = wheel_parts(r);
+    if (x - cx).hypot(y - cy) <= WHEEL_R + 6.0 {
+        Some(Part::Disc)
+    } else if (Rect { x: slider.x - 8.0, y: slider.y - 6.0, w: slider.w + 16.0, h: slider.h + 12.0 }).contains(x, y) {
+        Some(Part::Bright)
+    } else {
+        None
+    }
+}
+
+/// The color the mouse picks on a part of the wheel row, as hue, saturation and brightness.
+/// Dragging past the edge holds at the edge.
+pub fn pick(part: Part, r: Rect, x: f32, y: f32, (h, s, v): (f32, f32, f32)) -> (f32, f32, f32) {
+    let ((cx, cy), slider, _) = wheel_parts(r);
+    match part {
+        Part::Disc => ((y - cy).atan2(x - cx).to_degrees().rem_euclid(360.0), ((x - cx).hypot(y - cy) / WHEEL_R).min(1.0), v),
+        Part::Bright => (h, s, (1.0 - (y - slider.y) / slider.h).clamp(DARKEST, 1.0)),
+    }
 }
 
 pub fn content_height(rows: &[Row]) -> f32 {
@@ -109,13 +175,21 @@ struct Menu {
     scroll: f32,
     view_h: f32,
     focus_before: HWND,
+    /// While the wheel is being dragged: its row, the part, and the color so far.
+    /// Kept as hue, saturation and brightness so the hue holds while the color is gray or dark.
+    drag: Option<(usize, Part, (f32, f32, f32))>,
+}
+
+fn main_app<'a>() -> Option<&'a mut App> {
+    let main = HWND(crate::WINDOW.load(std::sync::atomic::Ordering::SeqCst) as *mut _);
+    unsafe { crate::app(main) }
 }
 
 fn knob_goal(row: &Row) -> f32 {
     match row {
         Row::Switch { on: true, .. } | Row::Radio { on: true, .. } => 1.0,
         // For a choice, the highlight's position: 0 under the first option, 1 under the second, and so on.
-        Row::Choice { chosen, .. } => *chosen as f32,
+        Row::Choice { chosen, .. } | Row::Swatches { chosen, .. } => *chosen as f32,
         _ => 0.0,
     }
 }
@@ -149,7 +223,7 @@ impl Menu {
         let mut y = top + TITLE_H;
         for (i, row) in rows.iter().enumerate() {
             let r = Rect { x, y, w, h: row.height() };
-            if hover == Some(i) && row.id().is_some() {
+            if hover == Some(i) && row.id().is_some() && !matches!(row, Row::Wheel { .. }) {
                 g.fill(Rect { y: r.y + 1.0, h: r.h - 2.0, ..r }, 8.0, WHITE, 0.08);
             }
             draw_row(g, row, knobs[i], r);
@@ -189,15 +263,63 @@ impl Menu {
         self.gfx.as_ref().map_or(1.0, |g| g.scale)
     }
 
-    /// Which option of the choice in row `i` is under the mouse, if any.
-    fn option_under(&self, i: usize, lparam: LPARAM) -> Option<usize> {
-        let Some(Row::Choice { options, .. }) = self.rows.get(i) else { return None };
+    fn mouse(&self, lparam: LPARAM) -> (f32, f32) {
         let scale = self.scale();
-        let (x, y) = ((lparam.0 & 0xFFFF) as i16 as f32 / scale, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / scale);
+        ((lparam.0 & 0xFFFF) as i16 as f32 / scale, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / scale)
+    }
+
+    /// Where row `i` is drawn right now.
+    fn row_rect(&self, i: usize) -> Rect {
         let panel = self.panel();
         let top = panel.y - self.scroll + TITLE_H + self.rows[..i].iter().map(Row::height).sum::<f32>();
-        let r = Rect { x: panel.x + GAP, y: top, w: panel.w - GAP * 2.0, h: ROW_H };
-        segments(r, options.len()).iter().position(|s| s.contains(x, y))
+        Rect { x: panel.x + GAP, y: top, w: panel.w - GAP * 2.0, h: self.rows[i].height() }
+    }
+
+    /// Which option of the choice in row `i` is under the mouse, if any.
+    fn option_under(&self, i: usize, lparam: LPARAM) -> Option<usize> {
+        let row = self.rows.get(i)?;
+        let (x, y) = self.mouse(lparam);
+        cells(row, self.row_rect(i)).iter().position(|s| s.contains(x, y))
+    }
+
+    /// Starts dragging on the color wheel, if the press is on it.
+    fn press(&mut self, lparam: LPARAM) -> bool {
+        let Some(i) = self.row_under(lparam) else { return false };
+        let Some(Row::Wheel { color, .. }) = self.rows.get(i) else { return false };
+        let (x, y) = self.mouse(lparam);
+        let Some(part) = wheel_part(self.row_rect(i), x, y) else { return false };
+        self.drag = Some((i, part, hsv(rgb(*color))));
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+        self.drag_to(lparam);
+        true
+    }
+
+    fn drag_to(&mut self, lparam: LPARAM) {
+        let Some((i, part, was)) = self.drag else { return };
+        let (x, y) = self.mouse(lparam);
+        let now = pick(part, self.row_rect(i), x, y, was);
+        self.drag = Some((i, part, now));
+        // Saved when the mouse lets go, not on every move.
+        self.set_color(hex(from_hsv(now.0, now.1, now.2)), false);
+    }
+
+    /// Changes the color being edited, and the glow with it.
+    fn set_color(&mut self, color: u32, save: bool) {
+        let Some(app) = main_app() else { return };
+        shell::set_glow_color(app, color, save);
+        self.refresh(app);
+    }
+
+    fn refresh(&mut self, app: &App) {
+        let rows = shell::menu_rows(app);
+        if rows.len() != self.rows.len() {
+            // Rows came or went, so the old switch positions no longer line up: start them where they belong.
+            self.knobs = rows.iter().map(knob_goal).collect();
+        }
+        self.rows = rows;
+        self.render();
     }
 
     fn row_under(&self, lparam: LPARAM) -> Option<usize> {
@@ -219,23 +341,22 @@ impl Menu {
     /// For a choice, `option` picks one; without it, Enter moves to the next.
     fn activate(&mut self, i: usize, option: Option<usize>) {
         let id = match self.rows.get(i) {
-            Some(Row::Choice { ids, chosen, .. }) => ids.get(option.unwrap_or((chosen + 1) % ids.len())).copied(),
+            Some(Row::Choice { ids, chosen, .. } | Row::Swatches { ids, chosen, .. }) => ids.get(option.unwrap_or((chosen + 1) % ids.len())).copied(),
+            // The wheel is changed by dragging or with the arrow keys.
+            Some(Row::Wheel { .. }) => None,
             Some(row) => row.id(),
             None => None,
         };
         let Some(id) = id else { return };
-        let main = HWND(crate::WINDOW.load(std::sync::atomic::Ordering::SeqCst) as *mut _);
-        let Some(app) = (unsafe { crate::app(main) }) else { return };
+        let Some(app) = main_app() else { return };
         if !shell::menu_choose(app, id) {
             self.close(true);
             return;
         }
-        self.rows = shell::menu_rows(app);
-        self.knobs.resize(self.rows.len(), 0.0);
+        self.refresh(app);
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_SWITCH, SWITCH_FRAME_MS, None);
         }
-        self.render();
     }
 
     fn close(&self, restore_focus: bool) {
@@ -267,17 +388,21 @@ fn draw_row(g: &mut Gfx, row: &Row, knob: f32, r: Rect) {
         Row::Switch { label, enabled, child, .. } => {
             let alpha = if *enabled { 1.0 } else { 0.35 };
             let indent = if *child { 16.0 } else { 8.0 };
-            let colour = if *child { MUTED } else { WHITE };
-            g.text(label, Rect { x: r.x + indent, y: r.y, w: r.w - indent - SWITCH_W - 16.0, h: r.h }, 12.0, false, Align::Left, colour, alpha);
+            let color = if *child { MUTED } else { WHITE };
+            g.text(label, Rect { x: r.x + indent, y: r.y, w: r.w - indent - SWITCH_W - 16.0, h: r.h }, 12.0, false, Align::Left, color, alpha);
             let track = Rect { x: r.x + r.w - SWITCH_W - 8.0, y: r.y + (r.h - SWITCH_H) / 2.0, w: SWITCH_W, h: SWITCH_H };
             g.fill(track, SWITCH_H / 2.0, WHITE, 0.16 * alpha);
             g.fill(track, SWITCH_H / 2.0, BLUE, knob * alpha);
             let travel = SWITCH_W - SWITCH_H;
             g.circle(track.x + SWITCH_H / 2.0 + travel * knob, track.y + SWITCH_H / 2.0, SWITCH_H / 2.0 - 2.0, WHITE, alpha);
         }
-        Row::Radio { label, .. } => {
-            g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 40.0, h: r.h }, 12.0, false, Align::Left, WHITE, 1.0);
+        Row::Radio { label, colors, .. } => {
+            let strip = if colors.is_empty() { 0.0 } else { 62.0 };
+            g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 40.0 - strip, h: r.h }, 12.0, false, Align::Left, WHITE, 1.0);
             let (cx, cy) = (r.x + r.w - 16.0, r.y + r.h / 2.0);
+            if !colors.is_empty() {
+                g.gradient(Rect { x: cx - 18.0 - 52.0, y: cy - 5.0, w: 52.0, h: 10.0 }, 5.0, colors, false);
+            }
             g.circle(cx, cy, 7.0, WHITE, 0.16);
             g.circle(cx, cy, 7.0, BLUE, knob);
             g.circle(cx, cy, 2.8, WHITE, knob);
@@ -294,9 +419,43 @@ fn draw_row(g: &mut Gfx, row: &Row, knob: f32, r: Rect) {
                 g.text(option, *cell, 11.0, near > 0.5, Align::Center, WHITE, 0.55 + 0.45 * near);
             }
         }
+        Row::Swatches { label, colors, .. } => {
+            let cells = swatch_cells(r, colors.len());
+            g.text(label, Rect { x: r.x + 16.0, y: r.y, w: r.w - 24.0 - SWATCH_W * colors.len() as f32, h: r.h }, 12.0, false, Align::Left, MUTED, 1.0);
+            for (n, (cell, c)) in cells.iter().zip(colors).enumerate() {
+                let (cx, cy) = (cell.x + cell.w / 2.0, cell.y + cell.h / 2.0);
+                // A ring that grows in around the one being changed.
+                let ring = 1.0 - (knob - n as f32).abs().min(1.0);
+                if ring > 0.0 {
+                    g.circle(cx, cy, 8.0 + 3.5 * ring, WHITE, ring);
+                    g.circle(cx, cy, 8.0 + 2.0 * ring, PANEL, 1.0);
+                }
+                g.circle(cx, cy, 8.0, *c, 1.0);
+            }
+        }
+        Row::Wheel { color, .. } => {
+            let ((cx, cy), slider, sample) = wheel_parts(r);
+            let (h, s, v) = hsv(rgb(*color));
+            g.circle(cx, cy, WHEEL_R + 1.0, WHITE, 0.14);
+            g.hue_wheel(cx, cy, WHEEL_R);
+            if v < 1.0 {
+                g.circle(cx, cy, WHEEL_R, 0x000000, 1.0 - v);
+            }
+            let (mx, my) = (cx + h.to_radians().cos() * s * WHEEL_R, cy + h.to_radians().sin() * s * WHEEL_R);
+            g.circle(mx, my, 7.5, WHITE, 1.0);
+            g.circle(mx, my, 5.5, *color, 1.0);
+            g.gradient(slider, slider.w / 2.0, &[hex(from_hsv(h, s, 1.0)), 0x000000], true);
+            let at = slider.y + (1.0 - (v - DARKEST) / (1.0 - DARKEST)) * slider.h;
+            let at = at.clamp(slider.y + 3.0, slider.y + slider.h - 3.0);
+            g.fill(Rect { x: slider.x - 3.0, y: at - 3.0, w: slider.w + 6.0, h: 6.0 }, 3.0, WHITE, 1.0);
+            g.fill(sample, 10.0, WHITE, 0.14);
+            g.fill(Rect { x: sample.x + 1.0, y: sample.y + 1.0, w: sample.w - 2.0, h: sample.h - 2.0 }, 9.0, *color, 1.0);
+            g.text(&format!("#{color:06X}"), Rect { x: sample.x, y: sample.y + sample.h + 6.0, w: sample.w, h: 16.0 }, 11.0, false, Align::Center, MUTED, 1.0);
+            g.text("Drag to pick", Rect { x: sample.x, y: sample.y + sample.h + 22.0, w: sample.w, h: 16.0 }, 10.0, false, Align::Center, FAINT, 1.0);
+        }
         Row::Button { label, enabled, danger, .. } => {
-            let colour = if *danger { RED } else { WHITE };
-            g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 16.0, h: r.h }, 12.0, false, Align::Left, colour, if *enabled { 1.0 } else { 0.35 });
+            let color = if *danger { RED } else { WHITE };
+            g.text(label, Rect { x: r.x + 8.0, y: r.y, w: r.w - 16.0, h: r.h }, 12.0, false, Align::Left, color, if *enabled { 1.0 } else { 0.35 });
         }
     }
 }
@@ -311,6 +470,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => {
             let _ = ValidateRect(Some(hwnd), None);
             m.render();
+        }
+        WM_LBUTTONDOWN => {
+            m.press(lparam);
+        }
+        WM_MOUSEMOVE if m.drag.is_some() => m.drag_to(lparam),
+        WM_LBUTTONUP if m.drag.is_some() => {
+            let _ = ReleaseCapture();
+            if let Some((_, _, (h, s, v))) = m.drag.take() {
+                m.set_color(hex(from_hsv(h, s, v)), true);
+            }
         }
         WM_MOUSEMOVE => {
             if !m.tracking {
@@ -332,8 +501,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => match m.row_under(lparam) {
             Some(i) => {
-                // A click on a choice's label, rather than an option, does nothing.
-                let is_choice = matches!(m.rows.get(i), Some(Row::Choice { .. }));
+                // A click on a choice's label, rather than an option, does nothing; nor does a click on the wheel.
+                let is_choice = matches!(m.rows.get(i), Some(Row::Choice { .. } | Row::Swatches { .. } | Row::Wheel { .. }));
                 match m.option_under(i, lparam) {
                     Some(option) => m.activate(i, Some(option)),
                     None if !is_choice => m.activate(i, None),
@@ -363,12 +532,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     m.activate(i, None);
                 }
             } else if key == VK_LEFT.0 || key == VK_RIGHT.0 {
-                // Left and Right pick an option of a choice directly.
-                if let Some((i, Row::Choice { options, chosen, .. })) = m.hover.and_then(|i| m.rows.get(i).map(|r| (i, r.clone()))) {
-                    let next = if key == VK_RIGHT.0 { (chosen + 1).min(options.len() - 1) } else { chosen.saturating_sub(1) };
-                    if next != chosen {
-                        m.activate(i, Some(next));
+                // Left and Right pick an option of a choice directly, or turn the color wheel.
+                let right = key == VK_RIGHT.0;
+                match m.hover.and_then(|i| m.rows.get(i).map(|r| (i, r.clone()))) {
+                    Some((i, Row::Choice { ids, chosen, .. } | Row::Swatches { ids, chosen, .. })) => {
+                        let next = if right { (chosen + 1).min(ids.len() - 1) } else { chosen.saturating_sub(1) };
+                        if next != chosen {
+                            m.activate(i, Some(next));
+                        }
                     }
+                    Some((_, Row::Wheel { color, .. })) => {
+                        let (h, s, v) = hsv(rgb(color));
+                        m.set_color(hex(from_hsv(h + if right { HUE_STEP } else { -HUE_STEP }, s, v)), true);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -380,6 +557,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_CLOSE => {
+            if m.drag.take().is_some() {
+                let _ = ReleaseCapture();
+            }
             let _ = DestroyWindow(hwnd);
         }
         WM_DESTROY => {
@@ -455,7 +635,7 @@ pub fn open(app: &mut App, from_notch: bool) {
             }
         };
         let knobs = rows.iter().map(knob_goal).collect();
-        let m = Box::into_raw(Box::new(Menu { hwnd, gfx, rows, knobs, hover: None, tracking: false, scroll: 0.0, view_h, focus_before: HWND::default() }));
+        let m = Box::into_raw(Box::new(Menu { hwnd, gfx, rows, knobs, hover: None, tracking: false, scroll: 0.0, view_h, focus_before: HWND::default(), drag: None }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, m as isize);
         app.menu = Some(hwnd);
         app.menu_holds_open = from_notch;
@@ -476,7 +656,7 @@ mod tests {
             Row::Header("A"),
             Row::Switch { id: 1, label: "one".into(), on: true, enabled: true, child: false },
             Row::Switch { id: 2, label: "off".into(), on: false, enabled: false, child: true },
-            Row::Radio { id: 3, label: "three".into(), on: true },
+            Row::Radio { id: 3, label: "three".into(), on: true, colors: vec![] },
             Row::Header("B"),
             Row::Button { id: 4, label: "four".into(), enabled: true, danger: true },
         ]
@@ -515,6 +695,35 @@ mod tests {
         assert!(cells[0].contains(cells[0].x + 1.0, 110.0) && !cells[1].contains(cells[0].x + 1.0, 110.0));
         let choice = Row::Choice { ids: vec![7, 8], label: "x".into(), options: vec!["a".into(), "b".into()], chosen: 1 };
         assert_eq!((choice.id(), knob_goal(&choice)), (Some(7), 1.0));
+    }
+
+    #[test]
+    fn the_wheel_picks_hue_from_the_angle_and_paleness_from_the_middle() {
+        let r = Rect { x: 0.0, y: 0.0, w: 284.0, h: WHEEL_H };
+        let ((cx, cy), slider, _) = wheel_parts(r);
+        assert_eq!(wheel_part(r, cx, cy), Some(Part::Disc));
+        assert_eq!(wheel_part(r, slider.x + 2.0, slider.y + 10.0), Some(Part::Bright));
+        assert_eq!(wheel_part(r, r.w - 4.0, cy), None);
+        // Straight right is red at full color, straight down a quarter turn on.
+        let (h, s, v) = pick(Part::Disc, r, cx + WHEEL_R, cy, (0.0, 0.0, 0.7));
+        assert!(h.abs() < 0.01 && (s - 1.0).abs() < 0.01 && v == 0.7);
+        assert!((pick(Part::Disc, r, cx, cy + 20.0, (0.0, 0.0, 1.0)).0 - 90.0).abs() < 0.01);
+        // Past the rim holds at full color.
+        assert_eq!(pick(Part::Disc, r, cx + 500.0, cy, (0.0, 0.0, 1.0)).1, 1.0);
+        // The top of the slider is full brightness, and the bottom stops before black.
+        assert_eq!(pick(Part::Bright, r, slider.x, slider.y - 40.0, (10.0, 0.5, 0.5)), (10.0, 0.5, 1.0));
+        assert_eq!(pick(Part::Bright, r, slider.x, slider.y + 900.0, (10.0, 0.5, 0.5)).2, DARKEST);
+    }
+
+    #[test]
+    fn swatches_sit_on_the_right_and_can_be_clicked() {
+        let r = Rect { x: 0.0, y: 0.0, w: 284.0, h: ROW_H };
+        let row = Row::Swatches { ids: vec![1, 2, 3], label: "x".into(), colors: vec![0, 0, 0], chosen: 2 };
+        let found = cells(&row, r);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[2].x + found[2].w, 284.0 - 4.0);
+        assert_eq!((row.id(), knob_goal(&row)), (Some(1), 2.0));
+        assert_eq!(Row::Wheel { id: 9, color: 0 }.height(), WHEEL_H);
     }
 
     #[test]

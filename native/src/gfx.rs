@@ -35,7 +35,7 @@ impl Rect {
     }
 }
 
-pub fn colour(hex: u32, alpha: f32) -> D2D1_COLOR_F {
+pub fn color(hex: u32, alpha: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: ((hex >> 16) & 255) as f32 / 255.0,
         g: ((hex >> 8) & 255) as f32 / 255.0,
@@ -48,7 +48,7 @@ pub struct Gfx {
     factory: ID2D1Factory1,
     dc: ID2D1DeviceContext,
     swap: IDXGISwapChain1,
-    _target: ID2D1Bitmap1,
+    target: ID2D1Bitmap1,
     _dcomp: IDCompositionDevice,
     _comp_target: IDCompositionTarget,
     _visual: IDCompositionVisual,
@@ -58,12 +58,20 @@ pub struct Gfx {
     art: Option<ID2D1BitmapBrush1>,
     art_rev: Option<u64>,
     art_size: (f32, f32),
-    art_colour: Option<u32>,
+    art_color: Option<u32>,
+    /// The color wheel's picture and its size in pixels, made the first time it is drawn.
+    wheel: Option<(u32, ID2D1Bitmap1)>,
     pub scale: f32,
 }
 
 impl Gfx {
     pub fn new(hwnd: HWND, width_px: u32, height_px: u32, scale: f32) -> Result<Gfx> {
+        Gfx::stretched(hwnd, width_px, height_px, scale, 1.0)
+    }
+
+    /// A surface drawn small and shown `stretch` times larger, smoothly. For soft things like the screen glow,
+    /// where full resolution would only cost memory.
+    pub fn stretched(hwnd: HWND, width_px: u32, height_px: u32, scale: f32, stretch: f32) -> Result<Gfx> {
         unsafe {
             let mut device = None;
             D3D11CreateDevice(
@@ -110,15 +118,19 @@ impl Gfx {
             let comp_target = dcomp.CreateTargetForHwnd(hwnd, true)?;
             let visual = dcomp.CreateVisual()?;
             visual.SetContent(&swap)?;
+            if stretch != 1.0 {
+                visual.SetTransform2(&matrix(stretch, 0.0, 0.0))?;
+                visual.SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR)?;
+            }
             comp_target.SetRoot(&visual)?;
             dcomp.Commit()?;
-            let brush = dc.CreateSolidColorBrush(&colour(0, 1.0), None)?;
+            let brush = dc.CreateSolidColorBrush(&color(0, 1.0), None)?;
             let dwrite = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             Ok(Gfx {
                 factory,
                 dc,
                 swap,
-                _target: target,
+                target,
                 _dcomp: dcomp,
                 _comp_target: comp_target,
                 _visual: visual,
@@ -128,7 +140,8 @@ impl Gfx {
                 art: None,
                 art_rev: None,
                 art_size: (1.0, 1.0),
-                art_colour: None,
+                art_color: None,
+                wheel: None,
                 scale,
             })
         }
@@ -138,7 +151,7 @@ impl Gfx {
         unsafe {
             self.dc.BeginDraw();
             self.dc.SetTransform(&matrix(self.scale, 0.0, 0.0));
-            self.dc.Clear(Some(&colour(0, 0.0)));
+            self.dc.Clear(Some(&color(0, 0.0)));
         }
     }
 
@@ -150,7 +163,23 @@ impl Gfx {
         }
     }
 
-    /// Draws a one-colour SVG icon into `r`. `view` is the icon's own size; `currentColor` in it becomes `hex`.
+    /// Like `end`, but does not wait for the screen: for a second window drawn in the same loop as the notch.
+    pub fn end_now(&self) -> Result<()> {
+        unsafe {
+            self.dc.EndDraw(None, None)?;
+            self.swap.Present(0, DXGI_PRESENT(0)).ok()
+        }
+    }
+
+    pub fn dc(&self) -> &ID2D1DeviceContext {
+        &self.dc
+    }
+
+    pub fn target(&self) -> &ID2D1Bitmap1 {
+        &self.target
+    }
+
+    /// Draws a one-color SVG icon into `r`. `view` is the icon's own size; `currentColor` in it becomes `hex`.
     pub fn svg(&self, svg: &str, view: f32, r: Rect, hex: u32, alpha: f32) {
         let text = svg.replace("fill=\"currentColor\"", &format!("fill=\"#{hex:06X}\" fill-opacity=\"{alpha:.3}\""));
         let Ok(dc) = self.dc.cast::<ID2D1DeviceContext5>() else { return };
@@ -182,7 +211,7 @@ impl Gfx {
 
     pub fn fill(&self, r: Rect, radius: f32, hex: u32, alpha: f32) {
         unsafe {
-            self.brush.SetColor(&colour(hex, alpha));
+            self.brush.SetColor(&color(hex, alpha));
             let rounded = D2D1_ROUNDED_RECT { rect: d2d_rect(r), radiusX: radius, radiusY: radius };
             self.dc.FillRoundedRectangle(&rounded, &self.brush);
         }
@@ -208,7 +237,7 @@ impl Gfx {
         };
         if let Ok(path) = build() {
             unsafe {
-                self.brush.SetColor(&colour(hex, alpha));
+                self.brush.SetColor(&color(hex, alpha));
                 self.dc.FillGeometry(&path, &self.brush, None);
             }
         }
@@ -227,7 +256,7 @@ impl Gfx {
         let Some(format) = self.format(size, bold, align, wrap) else { return };
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
-            self.brush.SetColor(&colour(hex, alpha));
+            self.brush.SetColor(&color(hex, alpha));
             self.dc.DrawText(&wide, &format, &d2d_rect(r), &self.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
         }
     }
@@ -282,7 +311,7 @@ impl Gfx {
         self.art_rev = Some(rev);
         self.art = bytes.and_then(|b| self.decode(b).ok());
         if self.art.is_none() {
-            self.art_colour = None;
+            self.art_color = None;
         }
     }
 
@@ -308,25 +337,25 @@ impl Gfx {
             converter.Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
             let bitmap = self.dc.CreateBitmapFromWicBitmap(&converter, None)?;
             self.art_size = (out_w as f32, out_h as f32);
-            // One pixel of the cover is its average colour, used for the glow behind the music page.
+            // One pixel of the cover is its average color, used for the glow behind the music page.
             let tiny = wic.CreateBitmapScaler()?;
             tiny.Initialize(&frame, 1, 1, WICBitmapInterpolationModeFant)?;
             let tiny_rgb = wic.CreateFormatConverter()?;
             tiny_rgb.Initialize(&tiny, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
             let mut pixel = [0u8; 4];
             tiny_rgb.CopyPixels(std::ptr::null(), 4, &mut pixel)?;
-            self.art_colour = Some(((pixel[2] as u32) << 16) | ((pixel[1] as u32) << 8) | pixel[0] as u32);
+            self.art_color = Some(((pixel[2] as u32) << 16) | ((pixel[1] as u32) << 8) | pixel[0] as u32);
             let bitmap: ID2D1Bitmap = bitmap.cast()?;
             self.dc.CreateBitmapBrush(&bitmap, None, None)
         }
     }
 
-    /// The cover's colour rising from the bottom edge, black at the top where the screen ends.
+    /// The cover's color rising from the bottom edge, black at the top where the screen ends.
     pub fn tint(&self, r: Rect, radius: f32, alpha: f32) {
-        let Some(hex) = self.art_colour else { return };
+        let Some(hex) = self.art_color else { return };
         let stops = [
-            D2D1_GRADIENT_STOP { position: 0.25, color: colour(hex, 0.0) },
-            D2D1_GRADIENT_STOP { position: 1.0, color: colour(hex, 0.5 * alpha) },
+            D2D1_GRADIENT_STOP { position: 0.25, color: color(hex, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(hex, 0.5 * alpha) },
         ];
         unsafe {
             let target: &ID2D1RenderTarget = &self.dc;
@@ -341,10 +370,43 @@ impl Gfx {
         }
     }
 
+    /// Fills `r` with colors blending from one to the next, evenly spaced, left to right or top to bottom.
+    pub fn gradient(&self, r: Rect, radius: f32, colors: &[u32], vertical: bool) {
+        match colors {
+            [] => {}
+            [one] => self.fill(r, radius, *one, 1.0),
+            _ => {
+                let last = (colors.len() - 1) as f32;
+                let stops: Vec<D2D1_GRADIENT_STOP> = colors.iter().enumerate().map(|(i, c)| D2D1_GRADIENT_STOP { position: i as f32 / last, color: color(*c, 1.0) }).collect();
+                unsafe {
+                    let target: &ID2D1RenderTarget = &self.dc;
+                    let Ok(collection) = target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+                    let end = if vertical { (r.x, r.y + r.h) } else { (r.x + r.w, r.y) };
+                    let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: point((r.x, r.y)), endPoint: point(end) };
+                    let Ok(brush) = target.CreateLinearGradientBrush(&line, None, &collection) else { return };
+                    let rounded = D2D1_ROUNDED_RECT { rect: d2d_rect(r), radiusX: radius, radiusY: radius };
+                    self.dc.FillRoundedRectangle(&rounded, &brush);
+                }
+            }
+        }
+    }
+
+    /// A disc of every color: the hue goes round it and the color gets paler towards the middle.
+    /// Hue 0 is to the right and grows clockwise, matching `glow::from_hsv` and `menu`'s picking.
+    pub fn hue_wheel(&mut self, cx: f32, cy: f32, radius: f32) {
+        let side = (radius * 2.0 * self.scale).ceil() as u32;
+        if self.wheel.as_ref().map(|(s, _)| *s) != Some(side) {
+            self.wheel = make_wheel(&self.dc, side).ok().map(|b| (side, b));
+        }
+        let Some((_, bitmap)) = &self.wheel else { return };
+        let dest = d2d_rect(Rect { x: cx - radius, y: cy - radius, w: radius * 2.0, h: radius * 2.0 });
+        unsafe { self.dc.DrawBitmap(bitmap, Some(&dest), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None) }
+    }
+
     pub fn draw_art(&self, r: Rect, radius: f32, alpha: f32) {
         let Some(brush) = &self.art else { return };
         unsafe {
-            // Cover the square and centre the image, so wide video thumbnails are not squashed.
+            // Cover the square and center the image, so wide video thumbnails are not squashed.
             let zoom = (r.w / self.art_size.0).max(r.h / self.art_size.1);
             let x = r.x + (r.w - self.art_size.0 * zoom) / 2.0;
             let y = r.y + (r.h - self.art_size.1 * zoom) / 2.0;
@@ -356,14 +418,37 @@ impl Gfx {
     }
 }
 
-fn matrix(scale: f32, x: f32, y: f32) -> windows_numerics::Matrix3x2 {
+fn make_wheel(dc: &ID2D1DeviceContext, side: u32) -> Result<ID2D1Bitmap1> {
+    let r = side as f32 / 2.0;
+    let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let (dx, dy) = (x as f32 + 0.5 - r, y as f32 + 0.5 - r);
+            let d = (dx * dx + dy * dy).sqrt();
+            // Soft by one pixel at the rim, so the edge is smooth.
+            let a = (r - d).clamp(0.0, 1.0);
+            let c = crate::glow::from_hsv(dy.atan2(dx).to_degrees(), (d / r).min(1.0), 1.0);
+            let byte = |v: f32| (v * a * 255.0).round() as u8; // premultiplied
+            pixels.extend([byte(c[2]), byte(c[1]), byte(c[0]), (a * 255.0).round() as u8]);
+        }
+    }
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        ..Default::default()
+    };
+    unsafe { dc.CreateBitmap(D2D_SIZE_U { width: side, height: side }, Some(pixels.as_ptr() as *const _), side * 4, &props) }
+}
+
+pub(crate) fn matrix(scale: f32, x: f32, y: f32) -> windows_numerics::Matrix3x2 {
     windows_numerics::Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: x, M32: y }
 }
 
-fn point(p: (f32, f32)) -> windows_numerics::Vector2 {
+pub(crate) fn point(p: (f32, f32)) -> windows_numerics::Vector2 {
     windows_numerics::Vector2 { X: p.0, Y: p.1 }
 }
 
-fn d2d_rect(r: Rect) -> D2D_RECT_F {
+pub(crate) fn d2d_rect(r: Rect) -> D2D_RECT_F {
     D2D_RECT_F { left: r.x, top: r.y, right: r.x + r.w, bottom: r.y + r.h }
 }

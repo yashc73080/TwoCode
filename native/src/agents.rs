@@ -255,7 +255,7 @@ pub enum Pill {
     Failed,
 }
 
-/// The pill's colour: a failure until you look, then active work, then a finish you have not seen.
+/// The pill's color: a failure until you look, then active work, then a finish you have not seen.
 pub fn pill_state(list: &[SessionView]) -> Pill {
     if list.iter().any(|s| s.status == Status::Error && s.unseen) {
         Pill::Failed
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(parse_claude(ask), vec![Event::Said("Blue or green?".into()), Event::ExternalWait("Waiting for your answer".into())]);
         let mut hub = Hub::default();
         hub.apply(Agent::Claude, "s", NOW, Event::Turn, NOW);
-        hub.apply(Agent::Claude, "s", NOW, Event::Said("Which colour do you want?".into()), NOW);
+        hub.apply(Agent::Claude, "s", NOW, Event::Said("Which color do you want?".into()), NOW);
         hub.apply(Agent::Claude, "s", NOW, Event::Done, NOW);
         assert_eq!(seen(&hub).status, Status::Waiting);
         assert_eq!(seen(&hub).status_text(), "Needs you");

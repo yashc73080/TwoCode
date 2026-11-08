@@ -148,7 +148,7 @@ impl Motion {
     }
 }
 
-/// Where tab `index` sits in a centred row. The index can be fractional while the marker slides.
+/// Where tab `index` sits in a centered row. The index can be fractional while the marker slides.
 pub fn tab_x(mid: f32, index: f32, count: usize, spacing: f32) -> f32 {
     mid + (index - (count as f32 - 1.0) / 2.0) * spacing
 }
@@ -282,13 +282,13 @@ mod tests {
 
     #[test]
     fn the_arrows_stay_inside_their_gutter() {
-        // A chevron reaches about 3.4 past its centre toward the page; the page's scrollbars start 8 inside it.
+        // A chevron reaches about 3.4 past its center toward the page; the page's scrollbars start 8 inside it.
         assert!(TAB_ARROW_INSET + 3.4 < ARROW_GUTTER + 8.0 - 2.0);
         assert!(TAB_ARROW_INSET - 2.0 > 0.0);
     }
 
     #[test]
-    fn the_tab_row_is_centred() {
+    fn the_tab_row_is_centered() {
         assert_eq!(tab_x(100.0, 0.0, 3, 30.0), 70.0);
         assert_eq!(tab_x(100.0, 1.0, 3, 30.0), 100.0);
         assert_eq!(tab_x(100.0, 0.5, 2, 30.0), 100.0);

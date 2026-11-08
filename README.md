@@ -20,7 +20,7 @@ It rests as a thin pill at the top of the screen and opens when you point at it.
 
 The closed pill also tells you things without opening:
 
-- **Its colour** follows your agents: blue while one is working, green when it finishes, red if it hits an error. It goes back to black once you've looked.
+- **Its color** follows your agents: blue while one is working, green when it finishes, red if it hits an error. It goes back to black once you've looked.
 - **Lyrics:** close the notch from the lyrics view and it keeps showing the current line.
 - **Meetings:** five minutes before an event, it shows the name and a countdown. The × dismisses it.
 - **Headphones:** when Bluetooth headphones connect or disconnect, it pops open with their name, plus the battery level when Windows reports one.

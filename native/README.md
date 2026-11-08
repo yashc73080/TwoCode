@@ -15,7 +15,7 @@ The app is `target/release/twocode.exe`. Only one copy runs at a time, so exit t
 
 `cargo test -- --ignored` also runs a test that asks the real LRCLIB service for lyrics.
 
-## How it's organised
+## How it's organized
 
 | File | What it does |
 | --- | --- |
