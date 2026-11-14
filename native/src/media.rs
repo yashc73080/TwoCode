@@ -1,12 +1,12 @@
 //! Whatever is playing on Windows, through the system media controls. Windows announces every change.
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::core::Result;
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session, GlobalSystemMediaTransportControlsSessionManager as Manager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus as Playback,
+    GlobalSystemMediaTransportControlsSessionPlaybackInfo as PlaybackInfo, GlobalSystemMediaTransportControlsSessionPlaybackStatus as Playback,
 };
 use windows::Storage::Streams::DataReader;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -61,6 +61,11 @@ fn position(position_ticks: i64, updated_ticks: i64, now_ticks: i64, playing: bo
     ((position_ticks + moved).max(0) / 10_000) as u64
 }
 
+/// Windows announces a change in bursts while it is still updating the session on its own threads. Reading in the
+/// middle of that has crashed inside Windows' media library (a double free when dropping playback info), so a
+/// refresh waits for the burst to settle. Play, skip and seek still happen at once.
+const SETTLE: Duration = Duration::from_millis(150);
+
 pub fn start(state: Arc<Mutex<Media>>, on_change: impl Fn() + Send + Sync + 'static) -> Sender<Command> {
     let (tx, rx) = channel();
     let events = tx.clone();
@@ -92,12 +97,17 @@ pub fn start(state: Arc<Mutex<Media>>, on_change: impl Fn() + Send + Sync + 'sta
         while let Ok(first) = rx.recv() {
             let mut refresh = false;
             let mut resubscribe = false;
-            for command in std::iter::once(first).chain(rx.try_iter()) {
+            let mut commands: Vec<Command> = std::iter::once(first).chain(rx.try_iter()).collect();
+            if commands.iter().all(|c| matches!(c, Command::Refresh | Command::Resubscribe)) {
+                std::thread::sleep(SETTLE);
+                commands.extend(rx.try_iter());
+            }
+            for command in commands {
                 match command {
                     Command::Refresh => refresh = true,
                     Command::Resubscribe => resubscribe = true,
                     other => {
-                        if let Some(session) = choose(&manager) {
+                        if let Some((session, _)) = choose(&manager) {
                             let _ = control(&session, other);
                             refresh = true;
                         }
@@ -161,17 +171,25 @@ fn unsubscribe(session: &Session, tokens: Tokens) {
     let _ = session.RemoveTimelinePropertiesChanged(tokens[2]);
 }
 
-fn is_playing(session: &Session) -> bool {
-    session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()).is_ok_and(|s| s == Playback::Playing)
+fn is_playing(info: &Option<PlaybackInfo>) -> bool {
+    info.as_ref().is_some_and(|i| i.PlaybackStatus().is_ok_and(|s| s == Playback::Playing))
 }
 
-/// Windows' current session, unless it is paused while another player is really playing.
-fn choose(manager: &Manager) -> Option<Session> {
-    let current = manager.GetCurrentSession().ok();
-    if current.as_ref().is_some_and(is_playing) {
+/// Windows' current session, unless it is paused while another player is really playing. Each session's playback
+/// info is asked for once and handed back, so a refresh touches Windows' media objects as little as it can.
+fn choose(manager: &Manager) -> Option<(Session, Option<PlaybackInfo>)> {
+    let current = manager.GetCurrentSession().ok().map(|s| {
+        let info = s.GetPlaybackInfo().ok();
+        (s, info)
+    });
+    if current.as_ref().is_some_and(|(_, info)| is_playing(info)) {
         return current;
     }
-    let playing = manager.GetSessions().ok().and_then(|list| list.into_iter().find(is_playing));
+    let sessions = manager.GetSessions().ok()?;
+    let playing = sessions.into_iter().filter(|s| current.as_ref().is_none_or(|(c, _)| c != s)).find_map(|s| {
+        let info = s.GetPlaybackInfo().ok();
+        is_playing(&info).then_some((s, info))
+    });
     playing.or(current)
 }
 
@@ -187,7 +205,7 @@ fn control(session: &Session, command: Command) -> Result<()> {
 }
 
 fn read(manager: &Manager, state: &Mutex<Media>, art_key: &mut String, art_found: &mut bool) -> Option<()> {
-    let Some(session) = choose(manager) else {
+    let Some((session, info)) = choose(manager) else {
         let mut media = state.lock().ok()?;
         let rev = media.art_rev;
         *media = Media { art_rev: rev + 1, ..Media::default() };
@@ -195,7 +213,7 @@ fn read(manager: &Manager, state: &Mutex<Media>, art_key: &mut String, art_found
         return Some(());
     };
     let props = session.TryGetMediaPropertiesAsync().ok()?.join().ok()?;
-    let info = session.GetPlaybackInfo().ok()?;
+    let info = info?;
     let timeline = session.GetTimelineProperties().ok()?;
     let title = props.Title().map(|t| t.to_string()).unwrap_or_default();
     let artist = props.Artist().map(|t| t.to_string()).unwrap_or_default();

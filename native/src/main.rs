@@ -8,6 +8,7 @@ mod config;
 mod gfx;
 mod glow;
 mod hooks;
+mod keeper;
 mod layout;
 mod lyrics;
 mod media;
@@ -1169,6 +1170,10 @@ unsafe extern "system" fn foreground_changed(_: HWINEVENTHOOK, _: u32, _: HWND, 
 }
 
 fn main() {
+    // Started plainly, this copy only keeps the real notch running and brings it back after a crash.
+    if !keeper::is_notch() && keeper::run() {
+        return;
+    }
     unsafe {
         // One notch is enough: a second start just leaves.
         let single = CreateMutexW(None, true, w!("Local\\TwoCodeNotch"));
@@ -1284,6 +1289,7 @@ fn main() {
         (*app).recreate_graphics();
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         shell::add_tray(hwnd);
+        shell::keep_start_menu_shortcut();
         SetTimer(Some(hwnd), TIMER_FULLSCREEN, 3000, None);
         SetTimer(Some(hwnd), TIMER_REMINDER, REMINDER_CHECK_MS, None);
         SetTimer(Some(hwnd), TIMER_TRIM, TRIM_AFTER_MS, None);

@@ -303,6 +303,35 @@ fn set_starts_with_windows(on: bool) {
     }
 }
 
+/// Puts TwoCode in the Start menu, pointing at this copy, so it can be started again from there.
+pub fn keep_start_menu_shortcut() {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let programs = std::path::PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs");
+    let icon = crate::config::dir().join("icon.ico");
+    let _ = std::fs::create_dir_all(crate::config::dir());
+    if std::fs::read(&icon).ok().as_deref() != Some(ICON) {
+        let _ = std::fs::write(&icon, ICON);
+    }
+    let saved = unsafe {
+        (|| -> windows::core::Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(&HSTRING::from(exe.as_os_str()))?;
+            if let Some(folder) = exe.parent() {
+                link.SetWorkingDirectory(&HSTRING::from(folder.as_os_str()))?;
+            }
+            link.SetDescription(w!("The TwoCode notch"))?;
+            link.SetIconLocation(&HSTRING::from(icon.as_os_str()), 0)?;
+            link.cast::<IPersistFile>()?.Save(&HSTRING::from(programs.join("TwoCode.lnk").as_os_str()), true)
+        })()
+    };
+    if let Err(why) = saved {
+        crate::config::log(&format!("could not add TwoCode to the Start menu: {why}"));
+    }
+}
+
 /// True when the active window covers its whole monitor, like a game, a video or slides.
 pub fn foreground_is_fullscreen(own: HWND) -> bool {
     unsafe {
